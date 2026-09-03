@@ -83,6 +83,13 @@ cargo run -- backend-self-test
 This uses an in-memory backend to test `SPAWN`, `KILL`, and `CLEANUP`. It does
 not create a process, namespace, mount, cgroup, or network connection.
 
+## Backend decision
+
+The planned first real backend is a separate `viper-helper` system service
+using systemd lifecycle, cgroups, and namespace controls. The decision and
+profile mapping are documented in [BACKEND_DECISION.md](BACKEND_DECISION.md).
+No privileged runner has been implemented yet.
+
 ## Status
 
 Working unprivileged simulator, private, pre-alpha. See [ARCHITECTURE.md](ARCHITECTURE.md),
