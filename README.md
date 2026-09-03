@@ -155,6 +155,9 @@ cargo run -- gateway-self-test --socket /tmp/viper-gateway-mock.sock
 The mock supports only `SEARCH`, `FETCH`, and `MODEL_GENERATE`, returns fixed
 responses, labels research data as `UNTRUSTED_EVIDENCE`, and rejects unknown
 tools. It never opens an outbound connection and is not a production gateway.
+The staged live-fetch policy is documented in
+[RESEARCH_GATEWAY_PLAN.md](RESEARCH_GATEWAY_PLAN.md); no external transport is
+enabled yet.
 
 ## Backend decision
 
