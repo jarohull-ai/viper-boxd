@@ -33,6 +33,7 @@ fn usage() {
     eprintln!("  viper-boxd backend-self-test --socket PATH");
     eprintln!("  viper-boxd filesystem-probe --socket PATH");
     eprintln!("  viper-boxd network-probe --socket PATH");
+    eprintln!("  viper-boxd gateway-probe --socket PATH --gateway-ref REF");
     eprintln!("  viper-boxd gateway-self-test --socket PATH");
 }
 
@@ -319,6 +320,36 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("network probe error: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if args.get(1).map(String::as_str) == Some("gateway-probe") {
+        let socket =
+            arg_value(&args[2..], "--socket").unwrap_or_else(|| "/tmp/viper-helper.sock".into());
+        let gateway_ref = arg_value(&args[2..], "--gateway-ref")
+            .unwrap_or_else(|| "RESEARCH_PUBLIC_WEB_V1".into());
+        let request = Request {
+            version: IPC_VERSION.into(),
+            request_id: format!("gateway-probe-{}", std::process::id()),
+            method: "gateway_probe".into(),
+            params: json!({"gateway_ref": gateway_ref}),
+        };
+        match send_request(&socket, &request) {
+            Ok(response) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response)
+                        .expect("JSON serialization cannot fail")
+                );
+                return if response.ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                };
+            }
+            Err(error) => {
+                eprintln!("gateway probe error: {error}");
                 return ExitCode::from(2);
             }
         }

@@ -1,9 +1,13 @@
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     env, fs,
     io::{BufRead, BufReader, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::{
+        fs::FileTypeExt,
+        net::{UnixListener, UnixStream},
+    },
     process::Command,
     sync::{Arc, Mutex},
     thread,
@@ -18,6 +22,104 @@ struct UnitState {
     scratch_path: String,
 }
 type States = Arc<Mutex<BTreeMap<String, UnitState>>>;
+
+/// Administrator-owned mapping from a stable gateway reference to the local
+/// socket of a running gateway process. A spawn request may only name a
+/// reference from this map; it never supplies a raw socket path.
+type GatewayRegistry = BTreeMap<String, String>;
+
+#[derive(Debug, Deserialize)]
+struct GatewayRegistryFile {
+    schema: String,
+    #[serde(default)]
+    gateways: GatewayRegistry,
+}
+
+fn load_gateway_registry(path: &str) -> Result<GatewayRegistry, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => {
+            eprintln!(
+                "viper-helper: no gateway registry at {path}; GATEWAY_ONLY spawns will be rejected"
+            );
+            return Ok(GatewayRegistry::new());
+        }
+    };
+    let file: GatewayRegistryFile =
+        toml::from_str(&text).map_err(|e| format!("parse gateway registry: {e}"))?;
+    if file.schema != "viper-boxd.gateway-registry.v0" {
+        return Err("unsupported gateway registry schema".into());
+    }
+    Ok(file.gateways)
+}
+
+#[derive(Debug)]
+struct NetworkPlan {
+    mode: &'static str,
+    gateway_sockets: Vec<(String, String)>,
+}
+
+fn resolve_network(
+    params: &Value,
+    gateways: &GatewayRegistry,
+) -> Result<NetworkPlan, IpcErrorBody> {
+    let mode = params
+        .get("network_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("DENY");
+    match mode {
+        "DENY" => Ok(NetworkPlan {
+            mode: "DENY",
+            gateway_sockets: Vec::new(),
+        }),
+        "GATEWAY_ONLY" => {
+            let refs: Vec<String> = params
+                .get("gateway_refs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flat_map(|v| v.iter())
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            if refs.is_empty() {
+                return Err(error(
+                    "ERR_NETWORK_SETUP",
+                    "GATEWAY_ONLY requires at least one gateway_refs entry",
+                ));
+            }
+            let mut gateway_sockets = Vec::with_capacity(refs.len());
+            for gateway_ref in refs {
+                let socket = gateways.get(&gateway_ref).ok_or_else(|| {
+                    error(
+                        "ERR_NETWORK_SETUP",
+                        format!("unknown gateway reference: {gateway_ref}"),
+                    )
+                })?;
+                if !gateway_socket_is_live(socket) {
+                    return Err(error(
+                        "ERR_NETWORK_SETUP",
+                        format!("gateway {gateway_ref} socket is not available at {socket}"),
+                    ));
+                }
+                gateway_sockets.push((gateway_ref, socket.clone()));
+            }
+            Ok(NetworkPlan {
+                mode: "GATEWAY_ONLY",
+                gateway_sockets,
+            })
+        }
+        _ => Err(error(
+            "FAIL_CLOSED",
+            format!("network_mode {mode} is not enforceable by this helper"),
+        )),
+    }
+}
+
+fn gateway_socket_is_live(path: &str) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
+}
 fn command_available(command: &str) -> bool {
     env::var_os("PATH")
         .into_iter()
@@ -87,21 +189,6 @@ fn filesystem_policy(params: &Value, unit: &str) -> Result<String, IpcErrorBody>
     Ok(path)
 }
 
-fn network_policy(params: &Value) -> Result<(), IpcErrorBody> {
-    let mode = params
-        .get("network_mode")
-        .and_then(Value::as_str)
-        .unwrap_or("DENY");
-    if mode == "DENY" {
-        Ok(())
-    } else {
-        Err(error(
-            "FAIL_CLOSED",
-            "only network_mode DENY is enforceable by this helper",
-        ))
-    }
-}
-
 fn start_unit(
     unit: &str,
     ttl: u64,
@@ -109,6 +196,7 @@ fn start_unit(
     cpu: u64,
     memory: u64,
     scratch: &str,
+    gateway_sockets: &[(String, String)],
 ) -> Result<(), IpcErrorBody> {
     let unit_arg = format!("--unit={unit}");
     let runtime = format!("RuntimeMaxSec={ttl}s");
@@ -116,30 +204,43 @@ fn start_unit(
     let memory_limit = format!("MemoryMax={memory}");
     let writable = format!("ReadWritePaths={scratch}");
     let sleep_arg = sleep_seconds.to_string();
-    let mut child = Command::new("systemd-run")
-        .args([
-            "--user",
-            "--no-block",
-            &unit_arg,
-            "--property",
-            &runtime,
-            "--property",
-            &cpu_limit,
-            "--property",
-            &memory_limit,
-            "--property",
-            "PrivateTmp=yes",
-            "--property",
-            "ProtectHome=yes",
-            "--property",
-            "ProtectSystem=strict",
-            "--property",
-            &writable,
-            "--property",
-            "PrivateNetwork=yes",
-            "/usr/bin/sleep",
-            &sleep_arg,
-        ])
+    // Every gateway socket is bind-mounted at its own host path so the Box
+    // can reach exactly the gateways its profile resolved to, nothing else.
+    // PrivateNetwork=yes always stays set: a Unix socket bind does not grant
+    // any IP networking, so real network access remains fully denied.
+    let bind_paths: Vec<String> = gateway_sockets
+        .iter()
+        .map(|(_, socket)| format!("BindPaths={socket}:{socket}"))
+        .collect();
+
+    let mut command = Command::new("systemd-run");
+    command.args([
+        "--user",
+        "--no-block",
+        &unit_arg,
+        "--property",
+        &runtime,
+        "--property",
+        &cpu_limit,
+        "--property",
+        &memory_limit,
+        "--property",
+        "PrivateTmp=yes",
+        "--property",
+        "ProtectHome=yes",
+        "--property",
+        "ProtectSystem=strict",
+        "--property",
+        &writable,
+        "--property",
+        "PrivateNetwork=yes",
+    ]);
+    for bind_path in &bind_paths {
+        command.arg("--property").arg(bind_path);
+    }
+    command.args(["/usr/bin/sleep", &sleep_arg]);
+
+    let mut child = command
         .spawn()
         .map_err(|e| error("ERR_EXECUTION_START", e.to_string()))?;
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -241,7 +342,52 @@ fn run_network_probe() -> Result<Value, IpcErrorBody> {
         .map_err(|e| error("ERR_PROBE_OUTPUT", e.to_string()))
 }
 
-fn handle(request: Request, states: &States) -> Response {
+fn run_gateway_probe(gateway_ref: &str, socket: &str) -> Result<Value, IpcErrorBody> {
+    if !gateway_socket_is_live(socket) {
+        return Err(error(
+            "ERR_NETWORK_SETUP",
+            format!("gateway {gateway_ref} socket is not available at {socket}"),
+        ));
+    }
+    let probe = env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("viper-gateway-probe")))
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            error(
+                "ERR_PROBE_UNAVAILABLE",
+                "viper-gateway-probe binary is not built",
+            )
+        })?;
+    let unit = format!("viper-boxd-gateway-probe-{}", std::process::id());
+    let bind_path = format!("BindPaths={socket}:{socket}");
+    let output = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--wait",
+            "--pipe",
+            &format!("--unit={unit}"),
+            "--property",
+            "PrivateNetwork=yes",
+            "--property",
+            "ProtectHome=read-only",
+            "--property",
+            "ProtectSystem=strict",
+            "--property",
+            &bind_path,
+        ])
+        .arg(&probe)
+        .args(["--socket", socket])
+        .output()
+        .map_err(|e| error("ERR_PROBE_EXECUTION", e.to_string()))?;
+    if !output.status.success() {
+        return Err(command_error(output, "gateway probe", "ERR_PROBE_FAILED"));
+    }
+    serde_json::from_slice::<Value>(&output.stdout)
+        .map_err(|e| error("ERR_PROBE_OUTPUT", e.to_string()))
+}
+
+fn handle(request: Request, states: &States, gateways: &GatewayRegistry) -> Response {
     if request.version != IPC_VERSION {
         return response(
             request.request_id,
@@ -251,7 +397,7 @@ fn handle(request: Request, states: &States) -> Response {
     let id = request.request_id;
     let result = match request.method.as_str() {
         "capabilities" => Ok(
-            json!({"schema":"viper-boxd.capabilities.v0","probe_mode":"READ_ONLY","backend_ready":command_available("systemd-run") && command_available("systemctl"),"backend":"systemd-user","supported_operations":["spawn","status","kill","cleanup","filesystem_probe","network_probe"]}),
+            json!({"schema":"viper-boxd.capabilities.v0","probe_mode":"READ_ONLY","backend_ready":command_available("systemd-run") && command_available("systemctl"),"backend":"systemd-user","supported_operations":["spawn","status","kill","cleanup","filesystem_probe","network_probe","gateway_probe"]}),
         ),
         "spawn" => {
             let box_id = request
@@ -282,9 +428,10 @@ fn handle(request: Request, states: &States) -> Response {
                 Ok(limits) => limits,
                 Err(limit_error) => return response(id, Err(limit_error)),
             };
-            if let Err(network_error) = network_policy(&request.params) {
-                return response(id, Err(network_error));
-            }
+            let network_plan = match resolve_network(&request.params, gateways) {
+                Ok(plan) => plan,
+                Err(network_error) => return response(id, Err(network_error)),
+            };
             match safe_unit_name(box_id) {
                 None => Err(error("ERR_INVALID_REQUEST", "invalid box_id")),
                 Some(_) if !unsupported.is_empty() => Err(error(
@@ -315,7 +462,15 @@ fn handle(request: Request, states: &States) -> Response {
                         Ok(path) => path,
                         Err(e) => return response(id, Err(e)),
                     };
-                    match start_unit(&unit, ttl, sleep_seconds, cpu, memory, &scratch) {
+                    match start_unit(
+                        &unit,
+                        ttl,
+                        sleep_seconds,
+                        cpu,
+                        memory,
+                        &scratch,
+                        &network_plan.gateway_sockets,
+                    ) {
                         Err(e) => Err(e),
                         Ok(()) => {
                             states.lock().expect("state lock").insert(
@@ -350,8 +505,13 @@ fn handle(request: Request, states: &States) -> Response {
                                     }
                                 }
                             });
+                            let gateway_refs: Vec<&str> = network_plan
+                                .gateway_sockets
+                                .iter()
+                                .map(|(gateway_ref, _)| gateway_ref.as_str())
+                                .collect();
                             Ok(
-                                json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"STARTING","ttl_seconds":ttl,"cpu_quota_percent":cpu,"memory_limit_bytes":memory,"filesystem_mode":"STRICT","scratch_path":scratch,"network_mode":"DENY","private_network":true}),
+                                json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"STARTING","ttl_seconds":ttl,"cpu_quota_percent":cpu,"memory_limit_bytes":memory,"filesystem_mode":"STRICT","scratch_path":scratch,"network_mode":network_plan.mode,"gateway_refs":gateway_refs,"private_network":true}),
                             )
                         }
                     }
@@ -385,6 +545,33 @@ fn handle(request: Request, states: &States) -> Response {
                 "side_effects": true,
             })
         }),
+        "gateway_probe" => {
+            let gateway_ref = request
+                .params
+                .get("gateway_ref")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if gateway_ref.is_empty() {
+                Err(error("ERR_INVALID_REQUEST", "gateway_ref is required"))
+            } else {
+                match gateways.get(gateway_ref) {
+                    None => Err(error(
+                        "ERR_NETWORK_SETUP",
+                        format!("unknown gateway reference: {gateway_ref}"),
+                    )),
+                    Some(socket) => run_gateway_probe(gateway_ref, socket).map(|probe| {
+                        json!({
+                            "status": "PROBE_COMPLETED",
+                            "probe": probe,
+                            "gateway_ref": gateway_ref,
+                            "network_mode": "GATEWAY_ONLY",
+                            "private_network": true,
+                            "side_effects": true,
+                        })
+                    }),
+                }
+            }
+        }
         "status" | "kill" | "cleanup" => {
             let handle = request
                 .params
@@ -482,11 +669,11 @@ fn handle(request: Request, states: &States) -> Response {
     };
     response(id, result)
 }
-fn serve(mut stream: UnixStream, states: &States) -> std::io::Result<()> {
+fn serve(mut stream: UnixStream, states: &States, gateways: &GatewayRegistry) -> std::io::Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let reply = match serde_json::from_str::<Request>(&line) {
-        Ok(req) => handle(req, states),
+        Ok(req) => handle(req, states, gateways),
         Err(e) => response(
             "unknown".into(),
             Err(error("ERR_INVALID_REQUEST", e.to_string())),
@@ -500,6 +687,10 @@ fn main() -> std::io::Result<()> {
     let socket = env::args()
         .nth(1)
         .unwrap_or_else(|| "/tmp/viper-helper.sock".into());
+    let registry_path = env::args()
+        .nth(2)
+        .unwrap_or_else(|| "examples/gateway-registry.toml".into());
+    let gateways = load_gateway_registry(&registry_path).map_err(std::io::Error::other)?;
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
     eprintln!("viper-helper listening on {socket}");
@@ -507,7 +698,7 @@ fn main() -> std::io::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(e) = serve(stream, &states) {
+                if let Err(e) = serve(stream, &states, &gateways) {
                     eprintln!("helper connection error: {e}");
                 }
             }
@@ -519,8 +710,9 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{filesystem_policy, network_policy, resource_limits};
+    use super::{filesystem_policy, resolve_network, resource_limits, GatewayRegistry};
     use serde_json::json;
+    use std::os::unix::net::UnixListener;
 
     #[test]
     fn accepts_valid_cpu_and_memory_limits() {
@@ -565,10 +757,70 @@ mod tests {
     }
 
     #[test]
-    fn rejects_network_modes_other_than_deny() {
-        assert!(network_policy(&json!({"network_mode": "RESEARCH"})).is_err());
-        assert!(network_policy(&json!({"network_mode": "MODEL_ONLY"})).is_err());
-        assert!(network_policy(&json!({})).is_ok());
-        assert!(network_policy(&json!({"network_mode": "DENY"})).is_ok());
+    fn rejects_network_modes_other_than_deny_and_gateway_only() {
+        let gateways = GatewayRegistry::new();
+        assert!(resolve_network(&json!({"network_mode": "RESEARCH"}), &gateways).is_err());
+        assert!(resolve_network(&json!({"network_mode": "MODEL_ONLY"}), &gateways).is_err());
+        assert!(resolve_network(&json!({}), &gateways).is_ok());
+        assert!(resolve_network(&json!({"network_mode": "DENY"}), &gateways).is_ok());
+    }
+
+    #[test]
+    fn gateway_only_requires_at_least_one_ref() {
+        let gateways = GatewayRegistry::new();
+        let error = resolve_network(
+            &json!({"network_mode": "GATEWAY_ONLY", "gateway_refs": []}),
+            &gateways,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "ERR_NETWORK_SETUP");
+    }
+
+    #[test]
+    fn gateway_only_rejects_unknown_reference() {
+        let gateways = GatewayRegistry::new();
+        let error = resolve_network(
+            &json!({"network_mode": "GATEWAY_ONLY", "gateway_refs": ["NOPE"]}),
+            &gateways,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "ERR_NETWORK_SETUP");
+    }
+
+    #[test]
+    fn gateway_only_rejects_a_registered_but_dead_socket() {
+        let mut gateways = GatewayRegistry::new();
+        gateways.insert(
+            "DEAD".into(),
+            "/tmp/viper-helper-test-nonexistent.sock".into(),
+        );
+        let error = resolve_network(
+            &json!({"network_mode": "GATEWAY_ONLY", "gateway_refs": ["DEAD"]}),
+            &gateways,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "ERR_NETWORK_SETUP");
+    }
+
+    #[test]
+    fn gateway_only_resolves_a_live_registered_socket() {
+        let path = std::env::temp_dir().join(format!(
+            "viper-helper-test-live-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _listener = UnixListener::bind(&path).expect("bind test gateway socket");
+
+        let mut gateways = GatewayRegistry::new();
+        gateways.insert("LIVE".into(), path.to_str().unwrap().to_owned());
+        let plan = resolve_network(
+            &json!({"network_mode": "GATEWAY_ONLY", "gateway_refs": ["LIVE"]}),
+            &gateways,
+        )
+        .expect("live socket resolves");
+        assert_eq!(plan.mode, "GATEWAY_ONLY");
+        assert_eq!(plan.gateway_sockets, vec![("LIVE".to_owned(), path.to_str().unwrap().to_owned())]);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

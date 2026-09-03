@@ -1,0 +1,10 @@
+# Administrator-owned mapping from a stable gateway reference to the local
+# Unix socket of a running gateway process. viper-helper resolves
+# `gateway_refs` against this file; it never accepts a raw socket path from a
+# spawn request. See BACKEND_DECISION.md ("gateway references, not
+# sockets/URLs") and GATEWAY_CONTRACT.md.
+schema = "viper-boxd.gateway-registry.v0"
+
+[gateways]
+RESEARCH_PUBLIC_WEB_V1 = "/tmp/viper-research-gateway.sock"
+MOCK_RESEARCH_V0 = "/tmp/viper-gateway-mock.sock"

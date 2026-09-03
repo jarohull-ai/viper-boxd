@@ -137,10 +137,36 @@ cargo run -- network-probe --socket /tmp/viper-helper.sock
 ```
 
 The expected result contains `external_network_blocked: true` and
-`local_network_blocked: true`. Other network modes are rejected fail-closed;
-gateway mediation is not implemented yet. In particular, this mode also
-blocks access to local Ollama/OpenClaw endpoints until a dedicated gateway is
-introduced.
+`local_network_blocked: true`. Any `network_mode` other than `DENY` or
+`GATEWAY_ONLY` is rejected fail-closed.
+
+### Gateway-only networking
+
+A Box may be granted access to one or more running gateways without ever
+receiving a raw socket path or real network access. The helper resolves a
+`gateway_ref` against an administrator-owned registry file (never against a
+caller-supplied path) and bind-mounts only that gateway's socket into the
+unit with `BindPaths=`. `PrivateNetwork=yes` stays set regardless: a Unix
+socket bind grants no IP networking, so direct network access remains fully
+denied. See [BACKEND_DECISION.md](BACKEND_DECISION.md) ("gateway references,
+not sockets/URLs") for the reasoning.
+
+```bash
+cargo build --bins
+cargo run --bin viper-gateway-mock -- /tmp/viper-gateway-mock.sock
+cargo run --bin viper-helper -- /tmp/viper-helper.sock examples/gateway-registry.toml
+cargo run --bin viper-boxd -- gateway-probe \
+  --socket /tmp/viper-helper.sock --gateway-ref MOCK_RESEARCH_V0
+```
+
+The probe runs `viper-gateway-probe` in a transient systemd unit whose only
+network path is the bind-mounted gateway socket. The expected result contains
+`gateway_reachable: true`, `gateway_denies_unknown_method: true` (proving
+default-deny holds even for an unsupported method), and the same
+`external_network_blocked: true` / `local_network_blocked: true` as the
+network-deny probe. A `spawn` request may request the same wiring for a real
+Box lifecycle with `"network_mode": "GATEWAY_ONLY", "gateway_refs": [...]`;
+an unknown or unreachable reference fails closed with `ERR_NETWORK_SETUP`.
 
 ### Mock gateway contract
 
