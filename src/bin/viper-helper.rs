@@ -5,18 +5,25 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
     process::Command,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 use viper_boxd::ipc::{IpcErrorBody, Request, Response, IPC_VERSION};
 
+#[derive(Debug, Clone)]
+struct UnitState {
+    unit: String,
+    status: String,
+}
+type States = Arc<Mutex<BTreeMap<String, UnitState>>>;
 fn response(request_id: String, result: Result<Value, IpcErrorBody>) -> Response {
     match result {
-        Ok(value) => Response {
+        Ok(result) => Response {
             version: IPC_VERSION.into(),
             request_id,
             ok: true,
-            result: Some(value),
+            result: Some(result),
             error: None,
         },
         Err(error) => Response {
@@ -28,35 +35,32 @@ fn response(request_id: String, result: Result<Value, IpcErrorBody>) -> Response
         },
     }
 }
-
 fn error(code: &str, message: impl Into<String>) -> IpcErrorBody {
     IpcErrorBody {
         code: code.into(),
         message: message.into(),
     }
 }
-
-fn safe_unit_name(box_id: &str) -> Option<String> {
-    if box_id.is_empty()
-        || box_id.len() > 48
-        || !box_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
-    {
-        return None;
-    }
-    Some(format!("viper-box-{box_id}"))
-}
-
 fn command_available(command: &str) -> bool {
     env::var_os("PATH")
         .into_iter()
-        .flat_map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|directory| directory.join(command))
-        .any(|candidate| candidate.is_file())
+        .flat_map(|p| env::split_paths(&p).collect::<Vec<_>>())
+        .map(|d| d.join(command))
+        .any(|p| p.is_file())
 }
-
-fn systemd_error(output: std::process::Output, operation: &str, code: &str) -> IpcErrorBody {
+fn safe_unit_name(id: &str) -> Option<String> {
+    if id.is_empty()
+        || id.len() > 48
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        None
+    } else {
+        Some(format!("viper-box-{id}"))
+    }
+}
+fn command_error(output: std::process::Output, operation: &str, code: &str) -> IpcErrorBody {
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     error(
         code,
@@ -70,13 +74,22 @@ fn systemd_error(output: std::process::Output, operation: &str, code: &str) -> I
         ),
     )
 }
-
-fn start_systemd_unit(unit: &str) -> Result<(), IpcErrorBody> {
+fn start_unit(unit: &str, ttl: u64, sleep_seconds: u64) -> Result<(), IpcErrorBody> {
     let unit_arg = format!("--unit={unit}");
+    let runtime = format!("RuntimeMaxSec={ttl}s");
+    let sleep_arg = sleep_seconds.to_string();
     let mut child = Command::new("systemd-run")
-        .args(["--user", "--no-block", &unit_arg, "/usr/bin/sleep", "10"])
+        .args([
+            "--user",
+            "--no-block",
+            &unit_arg,
+            "--property",
+            &runtime,
+            "/usr/bin/sleep",
+            &sleep_arg,
+        ])
         .spawn()
-        .map_err(|spawn_error| error("ERR_EXECUTION_START", spawn_error.to_string()))?;
+        .map_err(|e| error("ERR_EXECUTION_START", e.to_string()))?;
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match child.try_wait() {
@@ -90,12 +103,11 @@ fn start_systemd_unit(unit: &str) -> Result<(), IpcErrorBody> {
                 let _ = child.wait();
                 return Err(error("ERR_EXECUTION_START", "systemd-run timed out"));
             }
-            Err(wait_error) => return Err(error("ERR_EXECUTION_START", wait_error.to_string())),
+            Err(e) => return Err(error("ERR_EXECUTION_START", e.to_string())),
         }
     }
 }
-
-fn handle(request: Request, units: &mut BTreeMap<String, String>) -> Response {
+fn handle(request: Request, states: &States) -> Response {
     if request.version != IPC_VERSION {
         return response(
             request.request_id,
@@ -104,13 +116,9 @@ fn handle(request: Request, units: &mut BTreeMap<String, String>) -> Response {
     }
     let id = request.request_id;
     let result = match request.method.as_str() {
-        "capabilities" => Ok(json!({
-            "schema": "viper-boxd.capabilities.v0",
-            "probe_mode": "READ_ONLY",
-            "backend_ready": command_available("systemd-run") && command_available("systemctl"),
-            "backend": "systemd-user",
-            "supported_operations": ["spawn", "status", "kill", "cleanup"]
-        })),
+        "capabilities" => Ok(
+            json!({"schema":"viper-boxd.capabilities.v0","probe_mode":"READ_ONLY","backend_ready":command_available("systemd-run") && command_available("systemctl"),"backend":"systemd-user","supported_operations":["spawn","status","kill","cleanup"]}),
+        ),
         "spawn" => {
             let box_id = request
                 .params
@@ -122,44 +130,82 @@ fn handle(request: Request, units: &mut BTreeMap<String, String>) -> Response {
                 .get("required_backend")
                 .and_then(Value::as_array)
                 .into_iter()
-                .flat_map(|items| items.iter())
+                .flat_map(|v| v.iter())
                 .filter_map(Value::as_str)
-                .filter(|requirement| {
-                    *requirement != "systemd_run"
-                        && *requirement != "systemd"
-                        && !command_available(requirement)
-                })
+                .filter(|r| *r != "systemd" && *r != "systemd_run")
                 .collect::<Vec<_>>();
-            let unit = safe_unit_name(box_id).ok_or_else(|| {
-                error(
-                    "ERR_INVALID_REQUEST",
-                    "box_id must contain only ASCII letters, digits, '-' or '_'",
-                )
-            });
-            match unit {
-                Err(e) => Err(e),
-                Ok(_) if !unsupported.is_empty() => Err(error(
+            let ttl = request
+                .params
+                .get("ttl_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(10);
+            let sleep_seconds = request
+                .params
+                .get("sleep_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(10);
+            match safe_unit_name(box_id) {
+                None => Err(error("ERR_INVALID_REQUEST", "invalid box_id")),
+                Some(_) if !unsupported.is_empty() => Err(error(
                     "FAIL_CLOSED",
                     format!(
                         "required capabilities are not enforceable: {}",
                         unsupported.join(", ")
                     ),
                 )),
-                Ok(_unit) if units.contains_key(box_id) => {
+                Some(_) if ttl == 0 || ttl > 86400 => Err(error(
+                    "ERR_INVALID_REQUEST",
+                    "ttl_seconds must be between 1 and 86400",
+                )),
+                Some(_) if sleep_seconds == 0 || sleep_seconds > 300 => Err(error(
+                    "ERR_INVALID_REQUEST",
+                    "sleep_seconds must be between 1 and 300",
+                )),
+                Some(_) if states.lock().expect("state lock").contains_key(box_id) => {
                     Err(error("ERR_DUPLICATE_BOX", "box already exists"))
                 }
-                Ok(_unit) if !command_available("systemd-run") => Err(error(
+                Some(_unit) if !command_available("systemd-run") => Err(error(
                     "ERR_CAPABILITY_UNAVAILABLE",
                     "systemd-run is not available",
                 )),
-                Ok(unit) => match start_systemd_unit(&unit) {
+                Some(unit) => match start_unit(&unit, ttl, sleep_seconds) {
+                    Err(e) => Err(e),
                     Ok(()) => {
-                        units.insert(box_id.into(), unit.clone());
+                        states.lock().expect("state lock").insert(
+                            box_id.into(),
+                            UnitState {
+                                unit: unit.clone(),
+                                status: "STARTING".into(),
+                            },
+                        );
+                        let watchdog_states = Arc::clone(states);
+                        let watchdog_box = box_id.to_owned();
+                        let watchdog_unit = unit.clone();
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_secs(ttl.saturating_add(2)));
+                            let timed_out = watchdog_states
+                                .lock()
+                                .ok()
+                                .and_then(|s| {
+                                    s.get(&watchdog_box)
+                                        .map(|v| v.status == "STARTING" || v.status == "active")
+                                })
+                                .unwrap_or(false);
+                            if timed_out {
+                                let _ = Command::new("systemctl")
+                                    .args(["--user", "stop", &watchdog_unit])
+                                    .output();
+                                if let Ok(mut s) = watchdog_states.lock() {
+                                    if let Some(v) = s.get_mut(&watchdog_box) {
+                                        v.status = "TIMED_OUT".into();
+                                    }
+                                }
+                            }
+                        });
                         Ok(
-                            json!({"box_id": box_id, "unit": unit, "handle": format!("systemd:{unit}"), "status": "STARTING"}),
+                            json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"STARTING","ttl_seconds":ttl}),
                         )
                     }
-                    Err(error) => Err(error),
                 },
             }
         }
@@ -171,57 +217,72 @@ fn handle(request: Request, units: &mut BTreeMap<String, String>) -> Response {
                 .unwrap_or("");
             let unit = handle
                 .strip_prefix("systemd:")
-                .filter(|value| !value.is_empty());
-            let unit = unit.ok_or_else(|| error("ERR_HANDLE_UNKNOWN", "unknown systemd handle"));
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| error("ERR_HANDLE_UNKNOWN", "unknown systemd handle"));
             match (request.method.as_str(), unit) {
                 (_, Err(e)) => Err(e),
                 ("status", Ok(unit)) => {
-                    let output = Command::new("systemctl")
+                    if states
+                        .lock()
+                        .ok()
+                        .and_then(|s| {
+                            s.values()
+                                .find(|v| v.unit == unit)
+                                .map(|v| v.status == "TIMED_OUT")
+                        })
+                        .unwrap_or(false)
+                    {
+                        return response(
+                            id,
+                            Ok(json!({"handle":handle,"unit":unit,"status":"TIMED_OUT"})),
+                        );
+                    }
+                    match Command::new("systemctl")
                         .args(["--user", "show", "--value", "--property=ActiveState", unit])
-                        .output();
-                    match output {
-                        Ok(output) if output.status.success() => Ok(
-                            json!({"handle": handle, "unit": unit, "status": String::from_utf8_lossy(&output.stdout).trim()}),
+                        .output()
+                    {
+                        Ok(o) if o.status.success() => Ok(
+                            json!({"handle":handle,"unit":unit,"status":String::from_utf8_lossy(&o.stdout).trim()}),
                         ),
-                        Ok(output) => Err(systemd_error(output, "systemctl show", "ERR_INTERNAL")),
+                        Ok(o) => Err(command_error(o, "systemctl show", "ERR_INTERNAL")),
                         Err(e) => Err(error("ERR_INTERNAL", e.to_string())),
                     }
                 }
-                ("kill", Ok(unit)) => {
-                    let output = Command::new("systemctl")
-                        .args(["--user", "stop", unit])
-                        .output();
-                    match output {
-                        Ok(output) if output.status.success() => {
-                            Ok(json!({"handle": handle, "unit": unit, "status": "KILLED"}))
-                        }
-                        Ok(output) => {
-                            Err(systemd_error(output, "systemctl stop", "ERR_KILL_FAILED"))
-                        }
-                        Err(e) => Err(error("ERR_KILL_FAILED", e.to_string())),
-                    }
-                }
-                ("cleanup", Ok(unit)) => {
-                    let service_unit = format!("{unit}.service");
-                    let output = Command::new("systemctl")
-                        .args(["--user", "reset-failed", &service_unit])
-                        .output();
-                    match output {
-                        Ok(output) if output.status.success() => {
-                            Ok(json!({"handle": handle, "unit": unit, "status": "CLEANED"}))
-                        }
-                        Ok(output) => {
-                            let detail = String::from_utf8_lossy(&output.stderr);
-                            if detail.contains("not loaded") {
-                                Ok(json!({"handle": handle, "unit": unit, "status": "CLEANED"}))
-                            } else {
-                                Err(systemd_error(
-                                    output,
-                                    "systemctl reset-failed",
-                                    "ERR_CLEANUP_FAILED",
-                                ))
+                ("kill", Ok(unit)) => match Command::new("systemctl")
+                    .args(["--user", "stop", unit])
+                    .output()
+                {
+                    Ok(o) if o.status.success() => {
+                        if let Ok(mut s) = states.lock() {
+                            if let Some(v) = s.values_mut().find(|v| v.unit == unit) {
+                                v.status = "KILLED".into();
                             }
                         }
+                        Ok(json!({"handle":handle,"unit":unit,"status":"KILLED"}))
+                    }
+                    Ok(o) => Err(command_error(o, "systemctl stop", "ERR_KILL_FAILED")),
+                    Err(e) => Err(error("ERR_KILL_FAILED", e.to_string())),
+                },
+                ("cleanup", Ok(unit)) => {
+                    let service = format!("{unit}.service");
+                    match Command::new("systemctl")
+                        .args(["--user", "reset-failed", &service])
+                        .output()
+                    {
+                        Ok(o)
+                            if o.status.success()
+                                || String::from_utf8_lossy(&o.stderr).contains("not loaded") =>
+                        {
+                            if let Ok(mut s) = states.lock() {
+                                s.retain(|_, v| v.unit != unit);
+                            }
+                            Ok(json!({"handle":handle,"unit":unit,"status":"CLEANED"}))
+                        }
+                        Ok(o) => Err(command_error(
+                            o,
+                            "systemctl reset-failed",
+                            "ERR_CLEANUP_FAILED",
+                        )),
                         Err(e) => Err(error("ERR_CLEANUP_FAILED", e.to_string())),
                     }
                 }
@@ -232,25 +293,20 @@ fn handle(request: Request, units: &mut BTreeMap<String, String>) -> Response {
     };
     response(id, result)
 }
-
-fn serve_connection(
-    mut stream: UnixStream,
-    units: &mut BTreeMap<String, String>,
-) -> std::io::Result<()> {
+fn serve(mut stream: UnixStream, states: &States) -> std::io::Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-    let response = match serde_json::from_str::<Request>(&line) {
-        Ok(request) => handle(request, units),
-        Err(parse_error) => response(
+    let reply = match serde_json::from_str::<Request>(&line) {
+        Ok(req) => handle(req, states),
+        Err(e) => response(
             "unknown".into(),
-            Err(error("ERR_INVALID_REQUEST", parse_error.to_string())),
+            Err(error("ERR_INVALID_REQUEST", e.to_string())),
         ),
     };
-    serde_json::to_writer(&mut stream, &response).map_err(std::io::Error::other)?;
+    serde_json::to_writer(&mut stream, &reply).map_err(std::io::Error::other)?;
     stream.write_all(b"\n")?;
     stream.flush()
 }
-
 fn main() -> std::io::Result<()> {
     let socket = env::args()
         .nth(1)
@@ -258,15 +314,15 @@ fn main() -> std::io::Result<()> {
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
     eprintln!("viper-helper listening on {socket}");
-    let mut units = BTreeMap::new();
+    let states: States = Arc::new(Mutex::new(BTreeMap::new()));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = serve_connection(stream, &mut units) {
-                    eprintln!("helper connection error: {error}");
+                if let Err(e) = serve(stream, &states) {
+                    eprintln!("helper connection error: {e}");
                 }
             }
-            Err(error) => eprintln!("helper accept error: {error}"),
+            Err(e) => eprintln!("helper accept error: {e}"),
         }
     }
     Ok(())

@@ -4,7 +4,7 @@ mod noop_backend;
 use jfp_box::{parse_manifest, sha256_hex, validate};
 use serde::Deserialize;
 use serde_json::json;
-use std::{env, fs, process::ExitCode};
+use std::{env, fs, process::ExitCode, thread, time::Duration};
 use viper_boxd::ipc::{send_request, Request, IPC_VERSION};
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +153,7 @@ fn main() -> ExitCode {
     if args.get(1).map(String::as_str) == Some("backend-self-test") {
         let socket = arg_value(&args[2..], "--socket")
             .unwrap_or_else(|| "/tmp/viper-helper-mock.sock".into());
+        let selftest_box = format!("SELFTEST_BOX_{}", std::process::id());
         let result = (|| {
             let request = |request_id: &str, method: &str, params: serde_json::Value| Request {
                 version: IPC_VERSION.into(),
@@ -183,7 +184,7 @@ fn main() -> ExitCode {
                 &request(
                     "req-1",
                     "spawn",
-                    json!({"box_id": "UNSUPPORTED_BOX", "required_backend": ["mount_namespace"]}),
+                    json!({"box_id": format!("UNSUPPORTED_BOX_{}", std::process::id()), "required_backend": ["mount_namespace"]}),
                 ),
             )
             .map_err(|error| error.to_string())?;
@@ -192,15 +193,14 @@ fn main() -> ExitCode {
             {
                 return Err("mock helper accepted an unenforceable capability request".into());
             }
-            let spawn = send_request(
-                &socket,
-                &request(
-                    "req-2",
-                    "spawn",
-                    json!({"box_id": "SELFTEST_BOX", "required_backend": []}),
-                ),
-            )
-            .map_err(|error| error.to_string())?;
+            let ttl_test = helper_backend != "mock";
+            let spawn_params = if ttl_test {
+                json!({"box_id": selftest_box, "required_backend": [], "ttl_seconds": 2, "sleep_seconds": 30})
+            } else {
+                json!({"box_id": selftest_box, "required_backend": []})
+            };
+            let spawn = send_request(&socket, &request("req-2", "spawn", spawn_params))
+                .map_err(|error| error.to_string())?;
             let handle = spawn
                 .result
                 .as_ref()
@@ -208,11 +208,24 @@ fn main() -> ExitCode {
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| "spawn did not return a handle".to_owned())?
                 .to_owned();
+            if ttl_test {
+                thread::sleep(Duration::from_secs(6));
+            }
             let running = send_request(
                 &socket,
                 &request("req-3", "status", json!({"handle": handle})),
             )
             .map_err(|error| error.to_string())?;
+            if ttl_test
+                && running
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("status"))
+                    .and_then(|status| status.as_str())
+                    != Some("TIMED_OUT")
+            {
+                return Err("systemd helper did not report TIMED_OUT".into());
+            }
             let killed = send_request(
                 &socket,
                 &request("req-4", "kill", json!({"handle": handle})),
