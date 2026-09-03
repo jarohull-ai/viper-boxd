@@ -103,6 +103,26 @@ probe and refuses `spawn` when a requested capability is not enforceable. It
 does not create an isolated child, namespace, mount, cgroup, or network
 connection.
 
+### Filesystem isolation probe
+
+The real helper also exposes a deliberately narrow probe for the filesystem
+policy. It runs the checked-in `viper-fs-probe` binary in a transient systemd
+unit, permits writes only to a helper-created runtime scratch directory, and
+checks that a protected host path cannot be written:
+
+```bash
+cargo build --bins
+cargo run --bin viper-helper -- /tmp/viper-helper.sock
+cargo run -- filesystem-probe --socket /tmp/viper-helper.sock
+```
+
+The expected result contains `scratch_write: true` and
+`outside_write_denied: true`. This command has intentional side effects: it
+creates and removes one temporary runtime directory and transient systemd
+unit. It is a verification probe, not a general command runner. A successful
+probe demonstrates this tested policy on the current host; it is not a claim
+that the future privileged runner is complete or independently audited.
+
 ## Backend decision
 
 The planned first real backend is a separate `viper-helper` system service

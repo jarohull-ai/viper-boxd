@@ -105,10 +105,12 @@ fn filesystem_policy(params: &Value, unit: &str) -> Result<String, IpcErrorBody>
     if params.get("write_target").and_then(Value::as_str) != Some("scratch") {
         return Err(error("ERR_MOUNT_SETUP", "write_target must be scratch"));
     }
-    let path = format!("/tmp/viper-boxd-scratch-{unit}");
+    let runtime = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".to_owned());
+    let path = format!("{runtime}/viper-boxd-scratch-{unit}");
     fs::create_dir(&path).map_err(|e| error("ERR_MOUNT_SETUP", e.to_string()))?;
     Ok(path)
 }
+
 fn start_unit(
     unit: &str,
     ttl: u64,
@@ -164,6 +166,53 @@ fn start_unit(
         }
     }
 }
+
+fn run_filesystem_probe(scratch: &str) -> Result<Value, IpcErrorBody> {
+    let probe = env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("viper-fs-probe")))
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            error(
+                "ERR_PROBE_UNAVAILABLE",
+                "viper-fs-probe binary is not built",
+            )
+        })?;
+    let unit = format!("viper-boxd-probe-{}", std::process::id());
+    let writable = format!("ReadWritePaths={scratch}");
+    let output = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--wait",
+            "--pipe",
+            &format!("--unit={unit}"),
+            "--property",
+            "PrivateTmp=yes",
+            "--property",
+            // The probe binary is built in the repository under $HOME. Keep
+            // home read-only for this test so systemd can execute it while the
+            // attempted write to /root still verifies a denied host write.
+            "ProtectHome=read-only",
+            "--property",
+            "ProtectSystem=strict",
+            "--property",
+            &writable,
+        ])
+        .arg(&probe)
+        .args(["--scratch", scratch])
+        .output()
+        .map_err(|e| error("ERR_PROBE_EXECUTION", e.to_string()))?;
+    if !output.status.success() {
+        return Err(command_error(
+            output,
+            "filesystem probe",
+            "ERR_PROBE_FAILED",
+        ));
+    }
+    serde_json::from_slice::<Value>(&output.stdout)
+        .map_err(|e| error("ERR_PROBE_OUTPUT", e.to_string()))
+}
+
 fn handle(request: Request, states: &States) -> Response {
     if request.version != IPC_VERSION {
         return response(
@@ -277,6 +326,24 @@ fn handle(request: Request, states: &States) -> Response {
                     }
                 }
             }
+        }
+        "filesystem_probe" => {
+            let runtime =
+                env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".to_owned());
+            let scratch = format!("{runtime}/viper-boxd-probe-{}", std::process::id());
+            if let Err(e) = fs::create_dir(&scratch) {
+                return response(id, Err(error("ERR_PROBE_SETUP", e.to_string())));
+            }
+            let probe = run_filesystem_probe(&scratch);
+            let _ = fs::remove_dir_all(&scratch);
+            probe.map(|probe| {
+                json!({
+                    "status": "PROBE_COMPLETED",
+                    "probe": probe,
+                    "side_effects": true,
+                    "scratch_path": scratch,
+                })
+            })
         }
         "status" | "kill" | "cleanup" => {
             let handle = request

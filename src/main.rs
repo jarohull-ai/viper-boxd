@@ -31,6 +31,7 @@ fn usage() {
     eprintln!("  viper-boxd plan --manifest FILE --profile FILE --workspace-id ID [--json]");
     eprintln!("  viper-boxd capabilities");
     eprintln!("  viper-boxd backend-self-test --socket PATH");
+    eprintln!("  viper-boxd filesystem-probe --socket PATH");
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
@@ -260,6 +261,34 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("backend self-test error: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if args.get(1).map(String::as_str) == Some("filesystem-probe") {
+        let socket =
+            arg_value(&args[2..], "--socket").unwrap_or_else(|| "/tmp/viper-helper.sock".into());
+        let request = Request {
+            version: IPC_VERSION.into(),
+            request_id: format!("probe-{}", std::process::id()),
+            method: "filesystem_probe".into(),
+            params: json!({}),
+        };
+        match send_request(&socket, &request) {
+            Ok(response) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response)
+                        .expect("JSON serialization cannot fail")
+                );
+                return if response.ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                };
+            }
+            Err(error) => {
+                eprintln!("filesystem probe error: {error}");
                 return ExitCode::from(2);
             }
         }
