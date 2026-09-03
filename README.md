@@ -159,6 +159,13 @@ The staged live-fetch policy is documented in
 [RESEARCH_GATEWAY_PLAN.md](RESEARCH_GATEWAY_PLAN.md); no external transport is
 enabled yet.
 
+The transport layer is now available as the library module
+`research_fetcher`. It is policy-gated, uses `reqwest` with Rustls, disables
+proxy and redirects, pins a validated public DNS result for the request, and
+streams responses through the configured byte limit. It is not wired into a
+long-running gateway process yet; that integration remains a separately
+reviewed step.
+
 ## Backend decision
 
 The planned first real backend is a separate `viper-helper` system service
