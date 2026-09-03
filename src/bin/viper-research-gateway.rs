@@ -4,6 +4,7 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
+    sync::atomic::{AtomicU32, Ordering},
 };
 use viper_boxd::{
     ipc::{IpcErrorBody, Request, Response, IPC_VERSION},
@@ -78,7 +79,7 @@ fn error(code: &str, message: impl Into<String>) -> IpcErrorBody {
     }
 }
 
-fn handle(request: Request, policy: &ResearchPolicy) -> Response {
+fn handle(request: Request, policy: &ResearchPolicy, remaining: &AtomicU32) -> Response {
     if request.version != IPC_VERSION {
         return response(
             request.request_id,
@@ -90,16 +91,34 @@ fn handle(request: Request, policy: &ResearchPolicy) -> Response {
     }
     let id = request.request_id;
     let result = match request.method.as_str() {
-        "FETCH" => request
-            .params
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| error("ERR_INVALID_REQUEST", "FETCH requires params.url"))
-            .and_then(|url| {
-                research_fetcher::fetch(policy, url)
-                    .map(|result| serde_json::to_value(result).expect("fetch result serializes"))
-                    .map_err(|v| error(v.code, v.message))
-            }),
+        "FETCH" => {
+            if remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_sub(1)
+                })
+                .is_err()
+            {
+                return response(
+                    id,
+                    Err(error(
+                        "ERR_REQUEST_LIMIT_EXCEEDED",
+                        "research request budget exhausted",
+                    )),
+                );
+            }
+            request
+                .params
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| error("ERR_INVALID_REQUEST", "FETCH requires params.url"))
+                .and_then(|url| {
+                    research_fetcher::fetch(policy, url)
+                        .map(|result| {
+                            serde_json::to_value(result).expect("fetch result serializes")
+                        })
+                        .map_err(|v| error(v.code, v.message))
+                })
+        }
         "SEARCH" => Err(error(
             "ERR_NOT_IMPLEMENTED",
             "SEARCH provider is not configured yet",
@@ -112,11 +131,15 @@ fn handle(request: Request, policy: &ResearchPolicy) -> Response {
     response(id, result)
 }
 
-fn serve(mut stream: UnixStream, policy: &ResearchPolicy) -> std::io::Result<()> {
+fn serve(
+    mut stream: UnixStream,
+    policy: &ResearchPolicy,
+    remaining: &AtomicU32,
+) -> std::io::Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let reply = match serde_json::from_str::<Request>(&line) {
-        Ok(request) => handle(request, policy),
+        Ok(request) => handle(request, policy, remaining),
         Err(e) => response(
             "unknown".into(),
             Err(error("ERR_INVALID_REQUEST", e.to_string())),
@@ -142,8 +165,9 @@ fn main() -> std::io::Result<()> {
         config.gateway_id
     );
     let policy = config.policy();
+    let remaining = AtomicU32::new(config.max_requests);
     for stream in listener.incoming().flatten() {
-        let _ = serve(stream, &policy);
+        let _ = serve(stream, &policy, &remaining);
     }
     Ok(())
 }
