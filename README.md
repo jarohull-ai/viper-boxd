@@ -74,14 +74,22 @@ can enforce an isolation control; that requires backend-specific verification.
 
 ## No-op backend self-test
 
-The contract lifecycle can be exercised without system privileges:
+The contract lifecycle can be exercised through the unprivileged mock helper.
+In one terminal start the Unix-socket server:
 
 ```bash
-cargo run -- backend-self-test
+cargo run --bin viper-helper-mock -- /tmp/viper-helper-mock.sock
 ```
 
-This uses an in-memory backend to test `SPAWN`, `KILL`, and `CLEANUP`. It does
-not create a process, namespace, mount, cgroup, or network connection.
+Then run the viper-boxd IPC client in another:
+
+```bash
+cargo run --bin viper-boxd -- backend-self-test --socket /tmp/viper-helper-mock.sock
+```
+
+The mock helper tests `SPAWN`, `STATUS`, `KILL`, and `CLEANUP` over a
+versioned JSON-lines Unix socket. It does not create an isolated child,
+namespace, mount, cgroup, or network connection.
 
 ## Backend decision
 

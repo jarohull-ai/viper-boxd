@@ -1,10 +1,12 @@
 mod capabilities;
+#[cfg(test)]
 mod noop_backend;
 
 use jfp_box::{parse_manifest, sha256_hex, validate};
 use serde::Deserialize;
 use serde_json::json;
 use std::{env, fs, process::ExitCode};
+use viper_boxd::ipc::{send_request, Request, IPC_VERSION};
 
 #[derive(Debug, Deserialize)]
 struct Profile {
@@ -27,7 +29,7 @@ fn usage() {
     eprintln!("Usage:");
     eprintln!("  viper-boxd plan --manifest FILE --profile FILE --workspace-id ID [--json]");
     eprintln!("  viper-boxd capabilities");
-    eprintln!("  viper-boxd backend-self-test");
+    eprintln!("  viper-boxd backend-self-test --socket PATH");
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
@@ -150,28 +152,49 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.get(1).map(String::as_str) == Some("backend-self-test") {
-        let mut backend = noop_backend::NoopBackend::new();
-        let spec = noop_backend::BackendSpec {
-            box_id: "SELFTEST_BOX".into(),
-            task_id: "SELFTEST_TASK".into(),
-            workspace_id: "SELFTEST_WORKSPACE".into(),
-            profile_id: "SELFTEST_PROFILE".into(),
-            audit_trace_id: "SELFTEST_TRACE".into(),
-        };
+        let socket = arg_value(&args[2..], "--socket")
+            .unwrap_or_else(|| "/tmp/viper-helper-mock.sock".into());
         let result = (|| {
-            let handle = backend.spawn(&spec).map_err(|error| error.to_string())?;
-            let running = backend.status(&handle).map_err(|error| error.to_string())?;
-            backend.kill(&handle).map_err(|error| error.to_string())?;
-            let status = backend
-                .cleanup(&handle)
-                .map_err(|error| error.to_string())?;
+            let request = |request_id: &str, method: &str, params: serde_json::Value| Request {
+                version: IPC_VERSION.into(),
+                request_id: request_id.into(),
+                method: method.into(),
+                params,
+            };
+            let spawn = send_request(
+                &socket,
+                &request("req-1", "spawn", json!({"box_id": "SELFTEST_BOX"})),
+            )
+            .map_err(|error| error.to_string())?;
+            let handle = spawn
+                .result
+                .as_ref()
+                .and_then(|result| result.get("handle"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "spawn did not return a handle".to_owned())?
+                .to_owned();
+            let running = send_request(
+                &socket,
+                &request("req-2", "status", json!({"handle": handle})),
+            )
+            .map_err(|error| error.to_string())?;
+            let killed = send_request(
+                &socket,
+                &request("req-3", "kill", json!({"handle": handle})),
+            )
+            .map_err(|error| error.to_string())?;
+            let cleaned = send_request(
+                &socket,
+                &request("req-4", "cleanup", json!({"handle": handle})),
+            )
+            .map_err(|error| error.to_string())?;
             Ok::<_, String>(json!({
-                "schema": "viper-boxd.backend.self_test.v0",
-                "execution_mode": "NOOP_IN_MEMORY",
+                "schema": "viper-boxd.backend.ipc-self-test.v0",
+                "ipc_version": IPC_VERSION,
+                "execution_mode": "MOCK_HELPER_OVER_UNIX_SOCKET",
                 "side_effects": false,
-                "handle": handle.as_str(),
-                "running_status": format!("{running:?}"),
-                "final_status": format!("{status:?}")
+                "socket": socket,
+                "responses": [spawn, running, killed, cleaned]
             }))
         })();
         match result {
