@@ -17,6 +17,50 @@ pub struct FetchResult {
     pub text: String,
 }
 
+pub fn validate_response(
+    policy: &ResearchPolicy,
+    raw_url: &str,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<FetchResult, PolicyViolation> {
+    if (300..400).contains(&status) {
+        return Err(violation(
+            "ERR_REDIRECT_DENIED",
+            "redirects are disabled by policy",
+        ));
+    }
+    if !(200..300).contains(&status) {
+        return Err(violation(
+            "ERR_HTTP_STATUS",
+            format!("upstream returned HTTP {status}"),
+        ));
+    }
+    let content_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !(content_type.starts_with("text/") || content_type == "application/json") {
+        return Err(violation(
+            "ERR_CONTENT_TYPE_DENIED",
+            format!("content type {content_type:?} is not allowed"),
+        ));
+    }
+    policy.validate_fetch_size(body.len())?;
+    let text = String::from_utf8_lossy(body).into_owned();
+    Ok(FetchResult {
+        url: raw_url.to_owned(),
+        status,
+        content_type,
+        bytes: body.len(),
+        content_sha256: jfp_box::sha256_hex(body),
+        evidence_class: "UNTRUSTED_EVIDENCE",
+        text: crate::research_policy::sanitize_html(&text),
+    })
+}
+
 pub fn fetch(policy: &ResearchPolicy, raw_url: &str) -> Result<FetchResult, PolicyViolation> {
     let url = policy.validate_fetch_url(raw_url)?;
     let host = url
@@ -40,18 +84,7 @@ pub fn fetch(policy: &ResearchPolicy, raw_url: &str) -> Result<FetchResult, Poli
         .get(url)
         .send()
         .map_err(|e| violation("ERR_FETCH_FAILED", e.to_string()))?;
-    if response.status().is_redirection() {
-        return Err(violation(
-            "ERR_REDIRECT_DENIED",
-            "redirects are disabled by policy",
-        ));
-    }
-    if !response.status().is_success() {
-        return Err(violation(
-            "ERR_HTTP_STATUS",
-            format!("upstream returned HTTP {}", response.status()),
-        ));
-    }
+    let status = response.status().as_u16();
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -62,29 +95,12 @@ pub fn fetch(policy: &ResearchPolicy, raw_url: &str) -> Result<FetchResult, Poli
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    if !(content_type.starts_with("text/") || matches!(content_type.as_str(), "application/json")) {
-        return Err(violation(
-            "ERR_CONTENT_TYPE_DENIED",
-            format!("content type {content_type:?} is not allowed"),
-        ));
-    }
-    let status = response.status().as_u16();
     let mut limited = response.take(policy.max_fetch_bytes as u64 + 1);
     let mut body = Vec::new();
     limited
         .read_to_end(&mut body)
         .map_err(|e| violation("ERR_FETCH_READ", e.to_string()))?;
-    policy.validate_fetch_size(body.len())?;
-    let text = String::from_utf8_lossy(&body).into_owned();
-    Ok(FetchResult {
-        url: raw_url.to_owned(),
-        status,
-        content_type,
-        bytes: body.len(),
-        content_sha256: jfp_box::sha256_hex(&body),
-        evidence_class: "UNTRUSTED_EVIDENCE",
-        text: crate::research_policy::sanitize_html(&text),
-    })
+    validate_response(policy, raw_url, status, &content_type, &body)
 }
 
 fn resolve_public_address(host: &str) -> Option<IpAddr> {
@@ -125,7 +141,7 @@ fn violation(code: &'static str, message: impl Into<String>) -> PolicyViolation 
 
 #[cfg(test)]
 mod tests {
-    use super::fetch;
+    use super::{fetch, validate_response};
     use crate::research_policy::ResearchPolicy;
     #[test]
     fn rejects_policy_before_opening_network() {
@@ -141,5 +157,59 @@ mod tests {
     fn rejects_private_ip_before_fetch() {
         let error = fetch(&ResearchPolicy::mock(), "https://127.0.0.1").unwrap_err();
         assert_eq!(error.code, "ERR_PRIVATE_ADDRESS_DENIED");
+    }
+
+    #[test]
+    fn validates_success_hash_and_untrusted_evidence() {
+        let result = validate_response(
+            &ResearchPolicy::mock(),
+            "https://example.invalid",
+            200,
+            "text/html; charset=utf-8",
+            b"<p>safe</p>",
+        )
+        .unwrap();
+        assert_eq!(result.evidence_class, "UNTRUSTED_EVIDENCE");
+        assert_eq!(result.bytes, 11);
+        assert_eq!(result.content_sha256.len(), 64);
+        assert_eq!(result.text, "safe");
+    }
+
+    #[test]
+    fn rejects_redirect_wrong_type_and_oversize() {
+        let policy = ResearchPolicy::mock();
+        assert_eq!(
+            validate_response(&policy, "https://example.invalid", 302, "text/plain", b"x")
+                .unwrap_err()
+                .code,
+            "ERR_REDIRECT_DENIED"
+        );
+        assert_eq!(
+            validate_response(
+                &policy,
+                "https://example.invalid",
+                200,
+                "application/octet-stream",
+                b"x"
+            )
+            .unwrap_err()
+            .code,
+            "ERR_CONTENT_TYPE_DENIED"
+        );
+        assert_eq!(
+            validate_response(
+                &ResearchPolicy {
+                    max_fetch_bytes: 1,
+                    ..policy
+                },
+                "https://example.invalid",
+                200,
+                "text/plain",
+                b"xx"
+            )
+            .unwrap_err()
+            .code,
+            "ERR_FETCH_LIMIT_EXCEEDED"
+        );
     }
 }
