@@ -1,0 +1,7 @@
+schema = "viper-boxd.research-gateway.v0"
+gateway_id = "RESEARCH_PUBLIC_WEB_V1"
+allowed_domains = ["example.org"]
+max_requests = 30
+max_fetch_bytes = 5242880
+max_redirects = 0
+timeout_seconds = 10

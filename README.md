@@ -166,6 +166,16 @@ streams responses through the configured byte limit. It is not wired into a
 long-running gateway process yet; that integration remains a separately
 reviewed step.
 
+The first gateway process is available for controlled configuration testing:
+
+```bash
+cargo run --bin viper-research-gateway -- /tmp/viper-research-gateway.sock \
+  examples/research-gateway.toml
+```
+
+It currently exposes only policy-gated `FETCH`; `SEARCH` returns
+`ERR_NOT_IMPLEMENTED` until a provider and its audit policy are selected.
+
 ## Backend decision
 
 The planned first real backend is a separate `viper-helper` system service
