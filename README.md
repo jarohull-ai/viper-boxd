@@ -142,6 +142,20 @@ gateway mediation is not implemented yet. In particular, this mode also
 blocks access to local Ollama/OpenClaw endpoints until a dedicated gateway is
 introduced.
 
+### Mock gateway contract
+
+The gateway boundary is specified in [GATEWAY_CONTRACT.md](GATEWAY_CONTRACT.md)
+and can be exercised without network access:
+
+```bash
+cargo run --bin viper-gateway-mock -- /tmp/viper-gateway-mock.sock
+cargo run -- gateway-self-test --socket /tmp/viper-gateway-mock.sock
+```
+
+The mock supports only `SEARCH`, `FETCH`, and `MODEL_GENERATE`, returns fixed
+responses, labels research data as `UNTRUSTED_EVIDENCE`, and rejects unknown
+tools. It never opens an outbound connection and is not a production gateway.
+
 ## Backend decision
 
 The planned first real backend is a separate `viper-helper` system service

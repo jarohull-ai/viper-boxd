@@ -33,6 +33,7 @@ fn usage() {
     eprintln!("  viper-boxd backend-self-test --socket PATH");
     eprintln!("  viper-boxd filesystem-probe --socket PATH");
     eprintln!("  viper-boxd network-probe --socket PATH");
+    eprintln!("  viper-boxd gateway-self-test --socket PATH");
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
@@ -321,6 +322,53 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    }
+    if args.get(1).map(String::as_str) == Some("gateway-self-test") {
+        let socket = arg_value(&args[2..], "--socket")
+            .unwrap_or_else(|| "/tmp/viper-gateway-mock.sock".into());
+        let make = |id: &str, method: &str, params: serde_json::Value| Request {
+            version: IPC_VERSION.into(),
+            request_id: id.into(),
+            method: method.into(),
+            params,
+        };
+        let requests = [
+            make("gateway-search", "SEARCH", json!({"query": "viper-boxd"})),
+            make(
+                "gateway-fetch",
+                "FETCH",
+                json!({"url": "https://example.invalid/mock"}),
+            ),
+            make(
+                "gateway-model",
+                "MODEL_GENERATE",
+                json!({"prompt": "status"}),
+            ),
+            make("gateway-deny", "SHELL", json!({})),
+        ];
+        let mut responses = Vec::new();
+        for request in requests {
+            match send_request(&socket, &request) {
+                Ok(response) => responses.push(response),
+                Err(error) => {
+                    eprintln!("gateway self-test error: {error}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        let accepted = responses.iter().take(3).all(|r| r.ok)
+            && !responses[3].ok
+            && responses[3].error.as_ref().map(|e| e.code.as_str()) == Some("ERR_TOOL_NOT_ALLOWED");
+        let output = json!({"schema":"viper-boxd.gateway-self-test.v0","side_effects":false,"responses":responses});
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).expect("JSON serialization cannot fail")
+        );
+        return if accepted {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        };
     }
     if args.get(1).map(String::as_str) != Some("plan") {
         usage();
