@@ -27,3 +27,8 @@ The mock accepts no other methods and never opens an outbound connection. A
 future trusted gateway may implement these methods, but must preserve the
 versioned envelope, default-deny policy, rate limits, secret isolation, and
 audit trace fields.
+
+The initial research policy validator is implemented in
+`src/research_policy.rs`. It is deliberately transport-free: URL and limit
+checks can be tested without contacting the Internet. The live transport must
+pass those checks before it is introduced.

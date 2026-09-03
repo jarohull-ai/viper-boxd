@@ -5,6 +5,7 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
 };
 use viper_boxd::ipc::{IpcErrorBody, Request, Response, IPC_VERSION};
+use viper_boxd::research_policy::{sanitize_html, ResearchPolicy};
 
 fn response(request_id: String, result: Result<Value, IpcErrorBody>) -> Response {
     match result {
@@ -48,10 +49,12 @@ fn handle(request: Request) -> Response {
             "gateway": "mock-research-v0", "evidence_class": "UNTRUSTED_EVIDENCE",
             "query": query, "results": [{"title": "Mock result", "url": "https://example.invalid/mock", "snippet": "Deterministic mock evidence."}]
         })).ok_or_else(|| error("ERR_INVALID_REQUEST", "SEARCH requires params.query")),
-        "FETCH" => request.params.get("url").and_then(Value::as_str).filter(|v| v.starts_with("https://")).map(|url| json!({
-            "gateway": "mock-research-v0", "evidence_class": "UNTRUSTED_EVIDENCE",
-            "url": url, "content": "Deterministic mock fetched evidence.", "content_sha256": "mock-sha256"
-        })).ok_or_else(|| error("ERR_INVALID_REQUEST", "FETCH requires an https params.url")),
+        "FETCH" => request.params.get("url").and_then(Value::as_str).map(|url| {
+            ResearchPolicy::mock().validate_fetch_url(url).map(|validated| json!({
+                "gateway": "mock-research-v0", "evidence_class": "UNTRUSTED_EVIDENCE",
+                "url": validated.as_str(), "content": sanitize_html("<p>Deterministic mock fetched evidence.</p>"), "content_sha256": "mock-sha256"
+            })).map_err(|v| error(v.code, v.message))
+        }).unwrap_or_else(|| Err(error("ERR_INVALID_REQUEST", "FETCH requires params.url"))),
         "MODEL_GENERATE" => request.params.get("prompt").and_then(Value::as_str).filter(|v| !v.is_empty()).map(|prompt| json!({
             "gateway": "mock-model-v0", "classification": "MODEL_OUTPUT",
             "text": format!("Mock response for: {prompt}")
