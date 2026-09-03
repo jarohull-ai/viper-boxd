@@ -26,6 +26,19 @@ pub struct Capabilities {
     pub systemd_run: CapabilityObservation,
 }
 
+impl Capabilities {
+    pub fn supports_enforceable(&self, requirement: &str) -> bool {
+        match requirement {
+            "mount_namespace" => self.mount_namespace.enforceable,
+            "network_policy" | "network_namespace" => self.network_namespace.enforceable,
+            "cgroup_limits" | "cgroup_v2" => self.cgroup_v2.enforceable,
+            "user_namespaces" => self.user_namespaces.enforceable,
+            "systemd" | "systemd_run" => self.systemd_run.enforceable,
+            _ => false,
+        }
+    }
+}
+
 fn presence(path: &str, evidence: &str) -> CapabilityObservation {
     let detected = Path::new(path).exists();
     CapabilityObservation {

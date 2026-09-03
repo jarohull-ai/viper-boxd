@@ -1,4 +1,3 @@
-mod capabilities;
 #[cfg(test)]
 mod noop_backend;
 
@@ -146,7 +145,7 @@ fn main() -> ExitCode {
     if args.get(1).map(String::as_str) == Some("capabilities") {
         println!(
             "{}",
-            serde_json::to_string_pretty(&capabilities::probe())
+            serde_json::to_string_pretty(&viper_boxd::capabilities::probe())
                 .expect("JSON serialization cannot fail")
         );
         return ExitCode::SUCCESS;
@@ -161,9 +160,29 @@ fn main() -> ExitCode {
                 method: method.into(),
                 params,
             };
+            let capabilities = send_request(&socket, &request("req-0", "capabilities", json!({})))
+                .map_err(|error| error.to_string())?;
+            let refused = send_request(
+                &socket,
+                &request(
+                    "req-1",
+                    "spawn",
+                    json!({"box_id": "UNSUPPORTED_BOX", "required_backend": ["mount_namespace"]}),
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            if refused.ok
+                || refused.error.as_ref().map(|error| error.code.as_str()) != Some("FAIL_CLOSED")
+            {
+                return Err("mock helper accepted an unenforceable capability request".into());
+            }
             let spawn = send_request(
                 &socket,
-                &request("req-1", "spawn", json!({"box_id": "SELFTEST_BOX"})),
+                &request(
+                    "req-2",
+                    "spawn",
+                    json!({"box_id": "SELFTEST_BOX", "required_backend": []}),
+                ),
             )
             .map_err(|error| error.to_string())?;
             let handle = spawn
@@ -175,17 +194,17 @@ fn main() -> ExitCode {
                 .to_owned();
             let running = send_request(
                 &socket,
-                &request("req-2", "status", json!({"handle": handle})),
+                &request("req-3", "status", json!({"handle": handle})),
             )
             .map_err(|error| error.to_string())?;
             let killed = send_request(
                 &socket,
-                &request("req-3", "kill", json!({"handle": handle})),
+                &request("req-4", "kill", json!({"handle": handle})),
             )
             .map_err(|error| error.to_string())?;
             let cleaned = send_request(
                 &socket,
-                &request("req-4", "cleanup", json!({"handle": handle})),
+                &request("req-5", "cleanup", json!({"handle": handle})),
             )
             .map_err(|error| error.to_string())?;
             Ok::<_, String>(json!({
@@ -194,7 +213,7 @@ fn main() -> ExitCode {
                 "execution_mode": "MOCK_HELPER_OVER_UNIX_SOCKET",
                 "side_effects": false,
                 "socket": socket,
-                "responses": [spawn, running, killed, cleaned]
+                "responses": [capabilities, refused, spawn, running, killed, cleaned]
             }))
         })();
         match result {

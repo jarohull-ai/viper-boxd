@@ -19,12 +19,6 @@ pub struct BackendSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendHandle(String);
 
-impl BackendHandle {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {
     InvalidRequest(&'static str),

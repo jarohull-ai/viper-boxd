@@ -88,8 +88,10 @@ cargo run --bin viper-boxd -- backend-self-test --socket /tmp/viper-helper-mock.
 ```
 
 The mock helper tests `SPAWN`, `STATUS`, `KILL`, and `CLEANUP` over a
-versioned JSON-lines Unix socket. It does not create an isolated child,
-namespace, mount, cgroup, or network connection.
+versioned JSON-lines Unix socket. It first exposes the real read-only capability
+probe and refuses `spawn` when a requested capability is not enforceable. It
+does not create an isolated child, namespace, mount, cgroup, or network
+connection.
 
 ## Backend decision
 
