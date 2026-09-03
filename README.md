@@ -87,6 +87,16 @@ Then run the viper-boxd IPC client in another:
 cargo run --bin viper-boxd -- backend-self-test --socket /tmp/viper-helper-mock.sock
 ```
 
+The experimental systemd helper is a separate binary and is not used by the
+mock self-test:
+
+```bash
+cargo run --bin viper-helper -- /tmp/viper-helper.sock
+```
+
+It accepts only the fixed test executable `/usr/bin/sleep 10`; it does not
+accept arbitrary commands, paths, or systemd properties.
+
 The mock helper tests `SPAWN`, `STATUS`, `KILL`, and `CLEANUP` over a
 versioned JSON-lines Unix socket. It first exposes the real read-only capability
 probe and refuses `spawn` when a requested capability is not enforceable. It

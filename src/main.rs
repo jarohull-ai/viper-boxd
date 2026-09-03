@@ -172,6 +172,12 @@ fn main() -> ExitCode {
             {
                 return Err("helper returned an invalid capabilities response".into());
             }
+            let helper_backend = capabilities
+                .result
+                .as_ref()
+                .and_then(|result| result.get("backend"))
+                .and_then(|backend| backend.as_str())
+                .unwrap_or("unknown");
             let refused = send_request(
                 &socket,
                 &request(
@@ -220,8 +226,9 @@ fn main() -> ExitCode {
             Ok::<_, String>(json!({
                 "schema": "viper-boxd.backend.ipc-self-test.v0",
                 "ipc_version": IPC_VERSION,
-                "execution_mode": "MOCK_HELPER_OVER_UNIX_SOCKET",
-                "side_effects": false,
+                "execution_mode": if helper_backend == "mock" { "MOCK_HELPER_OVER_UNIX_SOCKET" } else { "SYSTEMD_HELPER_OVER_UNIX_SOCKET" },
+                "side_effects": helper_backend != "mock",
+                "helper_backend": helper_backend,
                 "socket": socket,
                 "responses": [capabilities, refused, spawn, running, killed, cleaned]
             }))

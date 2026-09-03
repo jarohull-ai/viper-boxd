@@ -49,8 +49,13 @@ fn handle(
     }
     let id = request.request_id;
     let result = match request.method.as_str() {
-        "capabilities" => serde_json::to_value(capability_report)
-            .map_err(|serialization| error("ERR_INTERNAL", serialization.to_string())),
+        "capabilities" => match serde_json::to_value(capability_report) {
+            Ok(mut value) => {
+                value["backend"] = json!("mock");
+                Ok(value)
+            }
+            Err(serialization) => Err(error("ERR_INTERNAL", serialization.to_string())),
+        },
         "spawn" => {
             let box_id = request
                 .params
@@ -163,4 +168,96 @@ fn main() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handle, Request};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use viper_boxd::capabilities::probe;
+
+    fn request(version: &str, method: &str, params: serde_json::Value) -> Request {
+        Request {
+            version: version.into(),
+            request_id: format!("test-{method}"),
+            method: method.into(),
+            params,
+        }
+    }
+
+    fn error_code(response: &viper_boxd::ipc::Response) -> &str {
+        response
+            .error
+            .as_ref()
+            .expect("response should contain an error")
+            .code
+            .as_str()
+    }
+
+    #[test]
+    fn unknown_handle_is_rejected_by_status_kill_and_cleanup() {
+        let mut states = BTreeMap::new();
+        let capabilities = probe();
+        for method in ["status", "kill", "cleanup"] {
+            let response = handle(
+                request("1.0", method, json!({"handle": "mock:DOES_NOT_EXIST"})),
+                &mut states,
+                &capabilities,
+            );
+            assert!(!response.ok);
+            assert_eq!(error_code(&response), "ERR_HANDLE_UNKNOWN");
+        }
+    }
+
+    #[test]
+    fn cleanup_of_an_active_box_is_rejected() {
+        let mut states = BTreeMap::new();
+        let capabilities = probe();
+        let spawn = handle(
+            request(
+                "1.0",
+                "spawn",
+                json!({"box_id": "ACTIVE", "required_backend": []}),
+            ),
+            &mut states,
+            &capabilities,
+        );
+        let handle_id = spawn.result.expect("spawn result")["handle"]
+            .as_str()
+            .expect("handle string")
+            .to_owned();
+        let response = handle(
+            request("1.0", "cleanup", json!({"handle": handle_id})),
+            &mut states,
+            &capabilities,
+        );
+        assert!(!response.ok);
+        assert_eq!(error_code(&response), "ERR_CLEANUP_FAILED");
+    }
+
+    #[test]
+    fn unsupported_protocol_version_is_rejected() {
+        let mut states = BTreeMap::new();
+        let response = handle(request("0.9", "status", json!({})), &mut states, &probe());
+        assert!(!response.ok);
+        assert_eq!(error_code(&response), "ERR_UNSUPPORTED_SCHEMA");
+    }
+
+    #[test]
+    fn missing_enforceable_capability_fails_closed() {
+        let mut states = BTreeMap::new();
+        let response = handle(
+            request(
+                "1.0",
+                "spawn",
+                json!({"box_id": "NETWORK_BOX", "required_backend": ["network_namespace"]}),
+            ),
+            &mut states,
+            &probe(),
+        );
+        assert!(!response.ok);
+        assert_eq!(error_code(&response), "FAIL_CLOSED");
+        assert!(states.is_empty(), "failed spawn must not create state");
+    }
 }
