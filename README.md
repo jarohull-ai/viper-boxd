@@ -166,6 +166,9 @@ streams responses through the configured byte limit. It is not wired into a
 long-running gateway process yet; that integration remains a separately
 reviewed step.
 
+The planned local TLS test harness and its acceptance criteria are documented
+in [TLS_TEST_HARNESS_PLAN.md](TLS_TEST_HARNESS_PLAN.md).
+
 The first gateway process is available for controlled configuration testing:
 
 ```bash
