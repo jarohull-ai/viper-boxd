@@ -7,6 +7,10 @@
 - document failure-closed behavior and audit events;
 - decide IPC mechanism and privilege model.
 
+Baseline decisions are recorded in [DESIGN_REVIEW.md](DESIGN_REVIEW.md) and the
+draft profile shape in [PROFILE_SCHEMA.md](PROFILE_SCHEMA.md). Implementation
+remains deferred until the simulator acceptance criteria are met.
+
 ## Phase 1 — Non-privileged simulator
 
 - `viper-boxd plan` consumes logical IDs only;
