@@ -12,15 +12,20 @@ use viper_boxd::research_policy::{PolicyViolation, ResearchPolicy};
 
 struct TlsTestServer {
     address: std::net::SocketAddr,
+    certificate_der: Vec<u8>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl TlsTestServer {
     fn start() -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("generate self-signed test certificate");
-        let certificate = CertificateDer::from(cert.cert.der().to_vec());
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_owned(),
+            "127.0.0.1".to_owned(),
+        ])
+        .expect("generate self-signed test certificate");
+        let certificate_der = cert.cert.der().to_vec();
+        let certificate = CertificateDer::from(certificate_der.clone());
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
         let config = ServerConfig::builder()
             .with_no_client_auth()
@@ -35,6 +40,7 @@ impl TlsTestServer {
         });
         Self {
             address,
+            certificate_der,
             thread: Some(thread),
         }
     }
@@ -111,20 +117,24 @@ fn serve_connection(stream: TcpStream, config: ServerConfig) {
 
 struct TestTlsTransport {
     address: std::net::SocketAddr,
+    certificate_der: Vec<u8>,
 }
 
 impl TestTlsTransport {
-    fn client(policy: &ResearchPolicy) -> Result<Client, PolicyViolation> {
+    fn client(&self, policy: &ResearchPolicy) -> Result<Client, PolicyViolation> {
+        let internal_error = |error: reqwest::Error| PolicyViolation {
+            code: "ERR_INTERNAL",
+            message: error.to_string(),
+        };
+        let root = reqwest::Certificate::from_der(&self.certificate_der).map_err(internal_error)?;
         Client::builder()
             .redirect(Policy::none())
             .no_proxy()
-            .danger_accept_invalid_certs(true)
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(root)
             .timeout(Duration::from_secs(policy.timeout_seconds))
             .build()
-            .map_err(|error| PolicyViolation {
-                code: "ERR_INTERNAL",
-                message: error.to_string(),
-            })
+            .map_err(internal_error)
     }
 }
 
@@ -136,7 +146,7 @@ impl HttpTransport for TestTlsTransport {
         _address: std::net::SocketAddr,
         policy: &ResearchPolicy,
     ) -> Result<TransportResponse, PolicyViolation> {
-        let client = Self::client(policy)?;
+        let client = self.client(policy)?;
         let target = format!("https://127.0.0.1:{}{}", self.address.port(), url.path());
         let response = client.get(target).send().map_err(|error| PolicyViolation {
             code: if error.is_timeout() {
@@ -173,6 +183,7 @@ fn fetch_fixture(
     let url = url::Url::parse(&server.url(path)).expect("fixture URL parses");
     let transport = TestTlsTransport {
         address: server.address,
+        certificate_der: server.certificate_der.clone(),
     };
     let response = transport.get(&url, "example.invalid", server.address, policy)?;
     validate_response(
@@ -228,4 +239,23 @@ fn tls_slow_response_times_out() {
     };
     let error = fetch_fixture(&server, "/slow", &policy).unwrap_err();
     assert_eq!(error.code, "ERR_TIMEOUT");
+}
+
+/// Proves the harness performs genuine certificate validation rather than
+/// disabling it: a client that does not trust this server's self-signed
+/// root must fail the handshake instead of silently succeeding.
+#[test]
+fn tls_connection_without_trusted_root_is_rejected() {
+    let server = TlsTestServer::start();
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .expect("build client with only built-in trust roots");
+    let target = format!("https://127.0.0.1:{}/ok", server.address.port());
+    let error = client.get(target).send().expect_err(
+        "a client without the test root must not complete the TLS handshake",
+    );
+    assert!(error.is_connect() || error.is_request());
 }
