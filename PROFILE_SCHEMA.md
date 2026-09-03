@@ -15,6 +15,7 @@ read_paths = ["workspace"]
 write_target = "scratch"
 required_backend = ["mount_namespace", "network_policy", "cgroup_limits"]
 execution_ttl_seconds = 300
+cpu_quota_percent = 50
 memory_limit_bytes = 1073741824
 max_model_tokens = 12000
 max_research_requests = 30

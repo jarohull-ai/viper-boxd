@@ -74,9 +74,40 @@ fn command_error(output: std::process::Output, operation: &str, code: &str) -> I
         ),
     )
 }
-fn start_unit(unit: &str, ttl: u64, sleep_seconds: u64) -> Result<(), IpcErrorBody> {
+fn resource_limits(params: &Value) -> Result<(u64, u64), IpcErrorBody> {
+    let cpu = params
+        .get("cpu_quota_percent")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| error("ERR_LIMIT_SETUP", "cpu_quota_percent is required"))?;
+    let memory = params
+        .get("memory_limit_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| error("ERR_LIMIT_SETUP", "memory_limit_bytes is required"))?;
+    if !(1..=100).contains(&cpu) {
+        return Err(error(
+            "ERR_LIMIT_SETUP",
+            "cpu_quota_percent must be between 1 and 100",
+        ));
+    }
+    if memory == 0 || memory > (1u64 << 50) {
+        return Err(error(
+            "ERR_LIMIT_SETUP",
+            "memory_limit_bytes must be between 1 and 2^50",
+        ));
+    }
+    Ok((cpu, memory))
+}
+fn start_unit(
+    unit: &str,
+    ttl: u64,
+    sleep_seconds: u64,
+    cpu: u64,
+    memory: u64,
+) -> Result<(), IpcErrorBody> {
     let unit_arg = format!("--unit={unit}");
     let runtime = format!("RuntimeMaxSec={ttl}s");
+    let cpu_limit = format!("CPUQuota={cpu}%");
+    let memory_limit = format!("MemoryMax={memory}");
     let sleep_arg = sleep_seconds.to_string();
     let mut child = Command::new("systemd-run")
         .args([
@@ -85,6 +116,10 @@ fn start_unit(unit: &str, ttl: u64, sleep_seconds: u64) -> Result<(), IpcErrorBo
             &unit_arg,
             "--property",
             &runtime,
+            "--property",
+            &cpu_limit,
+            "--property",
+            &memory_limit,
             "/usr/bin/sleep",
             &sleep_arg,
         ])
@@ -144,6 +179,10 @@ fn handle(request: Request, states: &States) -> Response {
                 .get("sleep_seconds")
                 .and_then(Value::as_u64)
                 .unwrap_or(10);
+            let limits = match resource_limits(&request.params) {
+                Ok(limits) => limits,
+                Err(limit_error) => return response(id, Err(limit_error)),
+            };
             match safe_unit_name(box_id) {
                 None => Err(error("ERR_INVALID_REQUEST", "invalid box_id")),
                 Some(_) if !unsupported.is_empty() => Err(error(
@@ -168,45 +207,48 @@ fn handle(request: Request, states: &States) -> Response {
                     "ERR_CAPABILITY_UNAVAILABLE",
                     "systemd-run is not available",
                 )),
-                Some(unit) => match start_unit(&unit, ttl, sleep_seconds) {
-                    Err(e) => Err(e),
-                    Ok(()) => {
-                        states.lock().expect("state lock").insert(
-                            box_id.into(),
-                            UnitState {
-                                unit: unit.clone(),
-                                status: "STARTING".into(),
-                            },
-                        );
-                        let watchdog_states = Arc::clone(states);
-                        let watchdog_box = box_id.to_owned();
-                        let watchdog_unit = unit.clone();
-                        thread::spawn(move || {
-                            thread::sleep(Duration::from_secs(ttl.saturating_add(2)));
-                            let timed_out = watchdog_states
-                                .lock()
-                                .ok()
-                                .and_then(|s| {
-                                    s.get(&watchdog_box)
-                                        .map(|v| v.status == "STARTING" || v.status == "active")
-                                })
-                                .unwrap_or(false);
-                            if timed_out {
-                                let _ = Command::new("systemctl")
-                                    .args(["--user", "stop", &watchdog_unit])
-                                    .output();
-                                if let Ok(mut s) = watchdog_states.lock() {
-                                    if let Some(v) = s.get_mut(&watchdog_box) {
-                                        v.status = "TIMED_OUT".into();
+                Some(unit) => {
+                    let (cpu, memory) = limits;
+                    match start_unit(&unit, ttl, sleep_seconds, cpu, memory) {
+                        Err(e) => Err(e),
+                        Ok(()) => {
+                            states.lock().expect("state lock").insert(
+                                box_id.into(),
+                                UnitState {
+                                    unit: unit.clone(),
+                                    status: "STARTING".into(),
+                                },
+                            );
+                            let watchdog_states = Arc::clone(states);
+                            let watchdog_box = box_id.to_owned();
+                            let watchdog_unit = unit.clone();
+                            thread::spawn(move || {
+                                thread::sleep(Duration::from_secs(ttl.saturating_add(2)));
+                                let timed_out = watchdog_states
+                                    .lock()
+                                    .ok()
+                                    .and_then(|s| {
+                                        s.get(&watchdog_box)
+                                            .map(|v| v.status == "STARTING" || v.status == "active")
+                                    })
+                                    .unwrap_or(false);
+                                if timed_out {
+                                    let _ = Command::new("systemctl")
+                                        .args(["--user", "stop", &watchdog_unit])
+                                        .output();
+                                    if let Ok(mut s) = watchdog_states.lock() {
+                                        if let Some(v) = s.get_mut(&watchdog_box) {
+                                            v.status = "TIMED_OUT".into();
+                                        }
                                     }
                                 }
-                            }
-                        });
-                        Ok(
-                            json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"STARTING","ttl_seconds":ttl}),
-                        )
+                            });
+                            Ok(
+                                json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"STARTING","ttl_seconds":ttl,"cpu_quota_percent":cpu,"memory_limit_bytes":memory}),
+                            )
+                        }
                     }
-                },
+                }
             }
         }
         "status" | "kill" | "cleanup" => {
@@ -326,4 +368,38 @@ fn main() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resource_limits;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_valid_cpu_and_memory_limits() {
+        assert_eq!(
+            resource_limits(&json!({"cpu_quota_percent": 50, "memory_limit_bytes": 536870912}))
+                .expect("valid limits"),
+            (50, 536870912)
+        );
+    }
+
+    #[test]
+    fn rejects_cpu_above_one_hundred_percent() {
+        assert!(resource_limits(
+            &json!({"cpu_quota_percent": 101, "memory_limit_bytes": 536870912})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_zero_or_excessive_memory() {
+        assert!(
+            resource_limits(&json!({"cpu_quota_percent": 50, "memory_limit_bytes": 0})).is_err()
+        );
+        assert!(resource_limits(
+            &json!({"cpu_quota_percent": 50, "memory_limit_bytes": 1u64 << 51})
+        )
+        .is_err());
+    }
 }

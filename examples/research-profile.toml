@@ -7,4 +7,5 @@ tool_bindings = ["MODEL_GENERATE->MODEL:VIPER_LOCAL_OLLAMA_V1", "SEARCH->RESEARC
 required_backend = ["mount_namespace", "network_policy", "cgroup_limits"]
 write_target = "scratch"
 execution_ttl_seconds = 300
+cpu_quota_percent = 50
 memory_limit_bytes = 1073741824
