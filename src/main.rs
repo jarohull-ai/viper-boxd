@@ -1,3 +1,5 @@
+mod capabilities;
+
 use jfp_box::{parse_manifest, sha256_hex, validate};
 use serde::Deserialize;
 use serde_json::json;
@@ -21,7 +23,9 @@ struct Profile {
 }
 
 fn usage() {
-    eprintln!("Usage: viper-boxd plan --manifest FILE --profile FILE --workspace-id ID [--json]");
+    eprintln!("Usage:");
+    eprintln!("  viper-boxd plan --manifest FILE --profile FILE --workspace-id ID [--json]");
+    eprintln!("  viper-boxd capabilities");
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
@@ -135,6 +139,14 @@ fn run_plan(args: &[String]) -> Result<(serde_json::Value, u8), String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
+    if args.get(1).map(String::as_str) == Some("capabilities") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&capabilities::probe())
+                .expect("JSON serialization cannot fail")
+        );
+        return ExitCode::SUCCESS;
+    }
     if args.get(1).map(String::as_str) != Some("plan") {
         usage();
         return ExitCode::from(2);

@@ -59,6 +59,19 @@ namespace changes, network operations, process spawns, or workspace writes.
 Exit codes are `0` for `PLAN_ACCEPTED`, `1` for a rejected plan, and `2` for
 CLI, file, or profile errors.
 
+## Capability probe
+
+The read-only capability probe reports kernel and tool presence without
+creating namespaces, mounts, cgroups, processes, or network connections:
+
+```bash
+cargo run -- capabilities
+```
+
+The result deliberately reports `backend_ready: false` and
+`enforceable: false`. Presence is not proof that a future privileged backend
+can enforce an isolation control; that requires backend-specific verification.
+
 ## Status
 
 Working unprivileged simulator, private, pre-alpha. See [ARCHITECTURE.md](ARCHITECTURE.md),
