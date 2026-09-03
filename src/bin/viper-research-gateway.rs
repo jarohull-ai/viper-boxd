@@ -174,12 +174,81 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::GatewayConfig;
+    use super::{handle, GatewayConfig};
+    use serde_json::json;
+    use std::sync::atomic::AtomicU32;
+    use viper_boxd::{
+        ipc::{Request, IPC_VERSION},
+        research_policy::ResearchPolicy,
+    };
     #[test]
     fn rejects_unknown_schema() {
         let path = "/tmp/viper-invalid-gateway.toml";
         std::fs::write(path, "schema='bad'\ngateway_id='x'\nallowed_domains=['x']\nmax_requests=1\nmax_fetch_bytes=1\nmax_redirects=0\ntimeout_seconds=1\n").unwrap();
         assert!(GatewayConfig::load(path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    fn request(method: &str, params: serde_json::Value) -> Request {
+        Request {
+            version: IPC_VERSION.into(),
+            request_id: "test".into(),
+            method: method.into(),
+            params,
+        }
+    }
+
+    #[test]
+    fn rejects_missing_url_and_unsupported_search() {
+        let policy = ResearchPolicy::mock();
+        let budget = AtomicU32::new(2);
+        assert_eq!(
+            handle(request("FETCH", json!({})), &policy, &budget)
+                .error
+                .unwrap()
+                .code,
+            "ERR_INVALID_REQUEST"
+        );
+        assert_eq!(
+            handle(request("SEARCH", json!({"query":"x"})), &policy, &budget)
+                .error
+                .unwrap()
+                .code,
+            "ERR_NOT_IMPLEMENTED"
+        );
+    }
+
+    #[test]
+    fn enforces_request_budget_before_transport() {
+        let policy = ResearchPolicy::mock();
+        let budget = AtomicU32::new(1);
+        let first = handle(
+            request("FETCH", json!({"url":"https://not-allowlisted.invalid"})),
+            &policy,
+            &budget,
+        );
+        assert!(!first.ok);
+        assert_eq!(budget.load(std::sync::atomic::Ordering::Acquire), 0);
+        let second = handle(
+            request("FETCH", json!({"url":"https://example.invalid"})),
+            &policy,
+            &budget,
+        );
+        assert_eq!(second.error.unwrap().code, "ERR_REQUEST_LIMIT_EXCEEDED");
+    }
+
+    #[test]
+    fn rejects_unknown_tool_and_client_options() {
+        let policy = ResearchPolicy::mock();
+        let budget = AtomicU32::new(2);
+        let response = handle(
+            request(
+                "SHELL",
+                json!({"proxy":"http://evil.invalid", "max_fetch_bytes": 1}),
+            ),
+            &policy,
+            &budget,
+        );
+        assert_eq!(response.error.unwrap().code, "ERR_TOOL_NOT_ALLOWED");
     }
 }
