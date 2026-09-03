@@ -13,6 +13,7 @@ allowed_gateways = ["MODEL_GATEWAY", "RESEARCH_GATEWAY"]
 tool_bindings = ["MODEL_GENERATE", "SEARCH", "FETCH"]
 read_paths = ["workspace"]
 write_target = "scratch"
+filesystem_mode = "STRICT"
 required_backend = ["mount_namespace", "network_policy", "cgroup_limits"]
 execution_ttl_seconds = 300
 cpu_quota_percent = 50

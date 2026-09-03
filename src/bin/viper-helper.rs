@@ -15,6 +15,7 @@ use viper_boxd::ipc::{IpcErrorBody, Request, Response, IPC_VERSION};
 struct UnitState {
     unit: String,
     status: String,
+    scratch_path: String,
 }
 type States = Arc<Mutex<BTreeMap<String, UnitState>>>;
 fn response(request_id: String, result: Result<Value, IpcErrorBody>) -> Response {
@@ -97,17 +98,30 @@ fn resource_limits(params: &Value) -> Result<(u64, u64), IpcErrorBody> {
     }
     Ok((cpu, memory))
 }
+fn filesystem_policy(params: &Value, unit: &str) -> Result<String, IpcErrorBody> {
+    if params.get("filesystem_mode").and_then(Value::as_str) != Some("STRICT") {
+        return Err(error("ERR_MOUNT_SETUP", "filesystem_mode must be STRICT"));
+    }
+    if params.get("write_target").and_then(Value::as_str) != Some("scratch") {
+        return Err(error("ERR_MOUNT_SETUP", "write_target must be scratch"));
+    }
+    let path = format!("/tmp/viper-boxd-scratch-{unit}");
+    fs::create_dir(&path).map_err(|e| error("ERR_MOUNT_SETUP", e.to_string()))?;
+    Ok(path)
+}
 fn start_unit(
     unit: &str,
     ttl: u64,
     sleep_seconds: u64,
     cpu: u64,
     memory: u64,
+    scratch: &str,
 ) -> Result<(), IpcErrorBody> {
     let unit_arg = format!("--unit={unit}");
     let runtime = format!("RuntimeMaxSec={ttl}s");
     let cpu_limit = format!("CPUQuota={cpu}%");
     let memory_limit = format!("MemoryMax={memory}");
+    let writable = format!("ReadWritePaths={scratch}");
     let sleep_arg = sleep_seconds.to_string();
     let mut child = Command::new("systemd-run")
         .args([
@@ -120,6 +134,14 @@ fn start_unit(
             &cpu_limit,
             "--property",
             &memory_limit,
+            "--property",
+            "PrivateTmp=yes",
+            "--property",
+            "ProtectHome=yes",
+            "--property",
+            "ProtectSystem=strict",
+            "--property",
+            &writable,
             "/usr/bin/sleep",
             &sleep_arg,
         ])
@@ -209,7 +231,11 @@ fn handle(request: Request, states: &States) -> Response {
                 )),
                 Some(unit) => {
                     let (cpu, memory) = limits;
-                    match start_unit(&unit, ttl, sleep_seconds, cpu, memory) {
+                    let scratch = match filesystem_policy(&request.params, &unit) {
+                        Ok(path) => path,
+                        Err(e) => return response(id, Err(e)),
+                    };
+                    match start_unit(&unit, ttl, sleep_seconds, cpu, memory, &scratch) {
                         Err(e) => Err(e),
                         Ok(()) => {
                             states.lock().expect("state lock").insert(
@@ -217,6 +243,7 @@ fn handle(request: Request, states: &States) -> Response {
                                 UnitState {
                                     unit: unit.clone(),
                                     status: "STARTING".into(),
+                                    scratch_path: scratch.clone(),
                                 },
                             );
                             let watchdog_states = Arc::clone(states);
@@ -244,7 +271,7 @@ fn handle(request: Request, states: &States) -> Response {
                                 }
                             });
                             Ok(
-                                json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"STARTING","ttl_seconds":ttl,"cpu_quota_percent":cpu,"memory_limit_bytes":memory}),
+                                json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"STARTING","ttl_seconds":ttl,"cpu_quota_percent":cpu,"memory_limit_bytes":memory,"filesystem_mode":"STRICT","scratch_path":scratch}),
                             )
                         }
                     }
@@ -315,6 +342,19 @@ fn handle(request: Request, states: &States) -> Response {
                             if o.status.success()
                                 || String::from_utf8_lossy(&o.stderr).contains("not loaded") =>
                         {
+                            let scratch = states.lock().ok().and_then(|s| {
+                                s.values()
+                                    .find(|v| v.unit == unit)
+                                    .map(|v| v.scratch_path.clone())
+                            });
+                            if let Some(path) = scratch {
+                                if let Err(e) = fs::remove_dir_all(&path) {
+                                    return response(
+                                        id,
+                                        Err(error("ERR_CLEANUP_FAILED", e.to_string())),
+                                    );
+                                }
+                            }
                             if let Ok(mut s) = states.lock() {
                                 s.retain(|_, v| v.unit != unit);
                             }
@@ -372,7 +412,7 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::resource_limits;
+    use super::{filesystem_policy, resource_limits};
     use serde_json::json;
 
     #[test]
@@ -399,6 +439,20 @@ mod tests {
         );
         assert!(resource_limits(
             &json!({"cpu_quota_percent": 50, "memory_limit_bytes": 1u64 << 51})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_non_strict_filesystem_policy() {
+        assert!(filesystem_policy(
+            &json!({"filesystem_mode": "OPEN", "write_target": "scratch"}),
+            "UNIT_TEST"
+        )
+        .is_err());
+        assert!(filesystem_policy(
+            &json!({"filesystem_mode": "STRICT", "write_target": "work"}),
+            "UNIT_TEST"
         )
         .is_err());
     }

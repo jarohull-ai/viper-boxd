@@ -6,6 +6,7 @@ allowed_gateways = ["MODEL:VIPER_LOCAL_OLLAMA_V1", "RESEARCH:PUBLIC_WEB_READONLY
 tool_bindings = ["MODEL_GENERATE->MODEL:VIPER_LOCAL_OLLAMA_V1", "SEARCH->RESEARCH:PUBLIC_WEB_READONLY_V1", "FETCH->RESEARCH:PUBLIC_WEB_READONLY_V1"]
 required_backend = ["mount_namespace", "network_policy", "cgroup_limits"]
 write_target = "scratch"
+filesystem_mode = "STRICT"
 execution_ttl_seconds = 300
 cpu_quota_percent = 50
 memory_limit_bytes = 1073741824

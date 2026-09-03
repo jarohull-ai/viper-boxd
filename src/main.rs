@@ -20,6 +20,7 @@ struct Profile {
     #[serde(default)]
     required_backend: Vec<String>,
     write_target: String,
+    filesystem_mode: String,
     execution_ttl_seconds: u64,
     cpu_quota_percent: u64,
     memory_limit_bytes: u64,
@@ -133,6 +134,7 @@ fn run_plan(args: &[String]) -> Result<(serde_json::Value, u8), String> {
             "allowed_gateways": profile.allowed_gateways,
             "tool_bindings": profile.tool_bindings,
             "write_target": profile.write_target,
+            "filesystem_mode": profile.filesystem_mode,
             "execution_ttl_seconds": profile.execution_ttl_seconds,
             "cpu_quota_percent": profile.cpu_quota_percent,
             "memory_limit_bytes": profile.memory_limit_bytes
@@ -197,9 +199,9 @@ fn main() -> ExitCode {
             }
             let ttl_test = helper_backend != "mock";
             let spawn_params = if ttl_test {
-                json!({"box_id": selftest_box, "required_backend": [], "ttl_seconds": 2, "sleep_seconds": 30, "cpu_quota_percent": 50, "memory_limit_bytes": 268435456})
+                json!({"box_id": selftest_box, "required_backend": [], "ttl_seconds": 2, "sleep_seconds": 30, "cpu_quota_percent": 50, "memory_limit_bytes": 268435456, "filesystem_mode": "STRICT", "write_target": "scratch"})
             } else {
-                json!({"box_id": selftest_box, "required_backend": [], "cpu_quota_percent": 50, "memory_limit_bytes": 268435456})
+                json!({"box_id": selftest_box, "required_backend": [], "cpu_quota_percent": 50, "memory_limit_bytes": 268435456, "filesystem_mode": "STRICT", "write_target": "scratch"})
             };
             let spawn = send_request(&socket, &request("req-2", "spawn", spawn_params))
                 .map_err(|error| error.to_string())?;
