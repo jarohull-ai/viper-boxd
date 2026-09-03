@@ -9,7 +9,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use viper_boxd::ipc::{IpcErrorBody, Request, Response, IPC_VERSION};
+use viper_boxd::ipc::{ipc_error as error, respond as response, IpcErrorBody, Request, Response, IPC_VERSION};
 
 #[derive(Debug, Clone)]
 struct UnitState {
@@ -18,30 +18,6 @@ struct UnitState {
     scratch_path: String,
 }
 type States = Arc<Mutex<BTreeMap<String, UnitState>>>;
-fn response(request_id: String, result: Result<Value, IpcErrorBody>) -> Response {
-    match result {
-        Ok(result) => Response {
-            version: IPC_VERSION.into(),
-            request_id,
-            ok: true,
-            result: Some(result),
-            error: None,
-        },
-        Err(error) => Response {
-            version: IPC_VERSION.into(),
-            request_id,
-            ok: false,
-            result: None,
-            error: Some(error),
-        },
-    }
-}
-fn error(code: &str, message: impl Into<String>) -> IpcErrorBody {
-    IpcErrorBody {
-        code: code.into(),
-        message: message.into(),
-    }
-}
 fn command_available(command: &str) -> bool {
     env::var_os("PATH")
         .into_iter()

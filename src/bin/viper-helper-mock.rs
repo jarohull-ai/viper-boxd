@@ -7,34 +7,8 @@ use std::{
 };
 use viper_boxd::{
     capabilities::CapabilityReport,
-    ipc::{IpcErrorBody, Request, Response, IPC_VERSION},
+    ipc::{ipc_error as error, respond as response, Request, Response, IPC_VERSION},
 };
-
-fn response(request_id: String, result: Result<Value, IpcErrorBody>) -> Response {
-    match result {
-        Ok(value) => Response {
-            version: IPC_VERSION.into(),
-            request_id,
-            ok: true,
-            result: Some(value),
-            error: None,
-        },
-        Err(error) => Response {
-            version: IPC_VERSION.into(),
-            request_id,
-            ok: false,
-            result: None,
-            error: Some(error),
-        },
-    }
-}
-
-fn error(code: &str, message: impl Into<String>) -> IpcErrorBody {
-    IpcErrorBody {
-        code: code.into(),
-        message: message.into(),
-    }
-}
 
 fn handle(
     request: Request,

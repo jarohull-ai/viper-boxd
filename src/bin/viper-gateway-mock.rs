@@ -4,34 +4,8 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
 };
-use viper_boxd::ipc::{IpcErrorBody, Request, Response, IPC_VERSION};
+use viper_boxd::ipc::{ipc_error as error, respond as response, Request, Response, IPC_VERSION};
 use viper_boxd::research_policy::{sanitize_html, ResearchPolicy};
-
-fn response(request_id: String, result: Result<Value, IpcErrorBody>) -> Response {
-    match result {
-        Ok(result) => Response {
-            version: IPC_VERSION.into(),
-            request_id,
-            ok: true,
-            result: Some(result),
-            error: None,
-        },
-        Err(error) => Response {
-            version: IPC_VERSION.into(),
-            request_id,
-            ok: false,
-            result: None,
-            error: Some(error),
-        },
-    }
-}
-
-fn error(code: &str, message: impl Into<String>) -> IpcErrorBody {
-    IpcErrorBody {
-        code: code.into(),
-        message: message.into(),
-    }
-}
 
 fn handle(request: Request) -> Response {
     if request.version != IPC_VERSION {

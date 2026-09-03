@@ -3,7 +3,8 @@ use serde_json::Value;
 use std::{
     fmt,
     io::{BufRead, BufReader, Write},
-    time::Duration,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub const IPC_VERSION: &str = "1.0";
@@ -21,6 +22,7 @@ pub struct Request {
 pub struct Response {
     pub version: String,
     pub request_id: String,
+    pub audit_trace_id: String,
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -32,6 +34,52 @@ pub struct Response {
 pub struct IpcErrorBody {
     pub code: String,
     pub message: String,
+}
+
+static AUDIT_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Process-unique audit trace id for one gateway request/response pair.
+/// Derived from a monotonic counter, PID, and timestamp instead of an
+/// external randomness source, keeping the dependency tree unchanged.
+pub fn generate_audit_trace_id() -> String {
+    let sequence = AUDIT_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seed = format!("{}-{nanos}-{sequence}", std::process::id());
+    format!("trace_{}", &jfp_box::sha256_hex(seed.as_bytes())[..16])
+}
+
+pub fn ipc_error(code: &str, message: impl Into<String>) -> IpcErrorBody {
+    IpcErrorBody {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+/// Builds a versioned, audit-traced response from a gateway or helper
+/// handler result. Shared so every backend stamps responses the same way.
+pub fn respond(request_id: String, result: Result<Value, IpcErrorBody>) -> Response {
+    let audit_trace_id = generate_audit_trace_id();
+    match result {
+        Ok(result) => Response {
+            version: IPC_VERSION.into(),
+            request_id,
+            audit_trace_id,
+            ok: true,
+            result: Some(result),
+            error: None,
+        },
+        Err(error) => Response {
+            version: IPC_VERSION.into(),
+            request_id,
+            audit_trace_id,
+            ok: false,
+            result: None,
+            error: Some(error),
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -86,7 +134,7 @@ pub fn send_request(_socket_path: &str, _request: &Request) -> Result<Response, 
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, IPC_VERSION};
+    use super::{generate_audit_trace_id, ipc_error, respond, Request, IPC_VERSION};
     use serde_json::json;
 
     #[test]
@@ -102,5 +150,25 @@ mod tests {
         assert!(encoded.contains("\"request_id\":\"req-1\""));
         assert!(encoded.contains("\"method\":\"status\""));
         assert!(encoded.contains("\"params\""));
+    }
+
+    #[test]
+    fn audit_trace_ids_are_unique_per_call() {
+        let first = generate_audit_trace_id();
+        let second = generate_audit_trace_id();
+        assert_ne!(first, second);
+        assert!(first.starts_with("trace_"));
+        assert_eq!(first.len(), "trace_".len() + 16);
+    }
+
+    #[test]
+    fn responses_carry_an_audit_trace_id() {
+        let ok = respond("req-1".into(), Ok(json!({"k": "v"})));
+        assert!(!ok.audit_trace_id.is_empty());
+        assert!(ok.audit_trace_id.starts_with("trace_"));
+
+        let err = respond("req-2".into(), Err(ipc_error("ERR_X", "bad")));
+        assert!(!err.audit_trace_id.is_empty());
+        assert_ne!(ok.audit_trace_id, err.audit_trace_id);
     }
 }
