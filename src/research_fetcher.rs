@@ -17,6 +17,65 @@ pub struct FetchResult {
     pub text: String,
 }
 
+#[derive(Debug)]
+pub struct TransportResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+pub trait HttpTransport {
+    fn get(
+        &self,
+        url: &url::Url,
+        host: &str,
+        address: SocketAddr,
+        policy: &ResearchPolicy,
+    ) -> Result<TransportResponse, PolicyViolation>;
+}
+
+pub struct ReqwestTransport;
+
+impl HttpTransport for ReqwestTransport {
+    fn get(
+        &self,
+        url: &url::Url,
+        host: &str,
+        address: SocketAddr,
+        policy: &ResearchPolicy,
+    ) -> Result<TransportResponse, PolicyViolation> {
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(policy.timeout_seconds))
+            .user_agent("viper-research-gateway/0.1")
+            .resolve(host, address)
+            .build()
+            .map_err(|e| violation("ERR_FETCH_CLIENT", e.to_string()))?;
+        let response = client
+            .get(url.clone())
+            .send()
+            .map_err(|e| violation("ERR_FETCH_FAILED", e.to_string()))?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let mut body = Vec::new();
+        response
+            .take(policy.max_fetch_bytes as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|e| violation("ERR_FETCH_READ", e.to_string()))?;
+        Ok(TransportResponse {
+            status,
+            content_type,
+            body,
+        })
+    }
+}
+
 pub fn validate_response(
     policy: &ResearchPolicy,
     raw_url: &str,
@@ -72,35 +131,14 @@ pub fn fetch(policy: &ResearchPolicy, raw_url: &str) -> Result<FetchResult, Poli
             "hostname did not resolve to a permitted public address",
         )
     })?;
-    let client = Client::builder()
-        .redirect(Policy::none())
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(policy.timeout_seconds))
-        .user_agent("viper-research-gateway/0.1")
-        .resolve(host, SocketAddr::new(address, 443))
-        .build()
-        .map_err(|e| violation("ERR_FETCH_CLIENT", e.to_string()))?;
-    let response = client
-        .get(url)
-        .send()
-        .map_err(|e| violation("ERR_FETCH_FAILED", e.to_string()))?;
-    let status = response.status().as_u16();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    let mut limited = response.take(policy.max_fetch_bytes as u64 + 1);
-    let mut body = Vec::new();
-    limited
-        .read_to_end(&mut body)
-        .map_err(|e| violation("ERR_FETCH_READ", e.to_string()))?;
-    validate_response(policy, raw_url, status, &content_type, &body)
+    let response = ReqwestTransport.get(&url, host, SocketAddr::new(address, 443), policy)?;
+    validate_response(
+        policy,
+        raw_url,
+        response.status,
+        &response.content_type,
+        &response.body,
+    )
 }
 
 fn resolve_public_address(host: &str) -> Option<IpAddr> {
