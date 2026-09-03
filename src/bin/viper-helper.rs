@@ -111,6 +111,21 @@ fn filesystem_policy(params: &Value, unit: &str) -> Result<String, IpcErrorBody>
     Ok(path)
 }
 
+fn network_policy(params: &Value) -> Result<(), IpcErrorBody> {
+    let mode = params
+        .get("network_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("DENY");
+    if mode == "DENY" {
+        Ok(())
+    } else {
+        Err(error(
+            "FAIL_CLOSED",
+            "only network_mode DENY is enforceable by this helper",
+        ))
+    }
+}
+
 fn start_unit(
     unit: &str,
     ttl: u64,
@@ -144,6 +159,8 @@ fn start_unit(
             "ProtectSystem=strict",
             "--property",
             &writable,
+            "--property",
+            "PrivateNetwork=yes",
             "/usr/bin/sleep",
             &sleep_arg,
         ])
@@ -213,6 +230,41 @@ fn run_filesystem_probe(scratch: &str) -> Result<Value, IpcErrorBody> {
         .map_err(|e| error("ERR_PROBE_OUTPUT", e.to_string()))
 }
 
+fn run_network_probe() -> Result<Value, IpcErrorBody> {
+    let probe = env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("viper-network-probe")))
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            error(
+                "ERR_PROBE_UNAVAILABLE",
+                "viper-network-probe binary is not built",
+            )
+        })?;
+    let unit = format!("viper-boxd-network-probe-{}", std::process::id());
+    let output = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--wait",
+            "--pipe",
+            &format!("--unit={unit}"),
+            "--property",
+            "PrivateNetwork=yes",
+            "--property",
+            "ProtectHome=read-only",
+            "--property",
+            "ProtectSystem=strict",
+        ])
+        .arg(&probe)
+        .output()
+        .map_err(|e| error("ERR_PROBE_EXECUTION", e.to_string()))?;
+    if !output.status.success() {
+        return Err(command_error(output, "network probe", "ERR_PROBE_FAILED"));
+    }
+    serde_json::from_slice::<Value>(&output.stdout)
+        .map_err(|e| error("ERR_PROBE_OUTPUT", e.to_string()))
+}
+
 fn handle(request: Request, states: &States) -> Response {
     if request.version != IPC_VERSION {
         return response(
@@ -223,7 +275,7 @@ fn handle(request: Request, states: &States) -> Response {
     let id = request.request_id;
     let result = match request.method.as_str() {
         "capabilities" => Ok(
-            json!({"schema":"viper-boxd.capabilities.v0","probe_mode":"READ_ONLY","backend_ready":command_available("systemd-run") && command_available("systemctl"),"backend":"systemd-user","supported_operations":["spawn","status","kill","cleanup"]}),
+            json!({"schema":"viper-boxd.capabilities.v0","probe_mode":"READ_ONLY","backend_ready":command_available("systemd-run") && command_available("systemctl"),"backend":"systemd-user","supported_operations":["spawn","status","kill","cleanup","filesystem_probe","network_probe"]}),
         ),
         "spawn" => {
             let box_id = request
@@ -254,6 +306,9 @@ fn handle(request: Request, states: &States) -> Response {
                 Ok(limits) => limits,
                 Err(limit_error) => return response(id, Err(limit_error)),
             };
+            if let Err(network_error) = network_policy(&request.params) {
+                return response(id, Err(network_error));
+            }
             match safe_unit_name(box_id) {
                 None => Err(error("ERR_INVALID_REQUEST", "invalid box_id")),
                 Some(_) if !unsupported.is_empty() => Err(error(
@@ -320,7 +375,7 @@ fn handle(request: Request, states: &States) -> Response {
                                 }
                             });
                             Ok(
-                                json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"STARTING","ttl_seconds":ttl,"cpu_quota_percent":cpu,"memory_limit_bytes":memory,"filesystem_mode":"STRICT","scratch_path":scratch}),
+                                json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"STARTING","ttl_seconds":ttl,"cpu_quota_percent":cpu,"memory_limit_bytes":memory,"filesystem_mode":"STRICT","scratch_path":scratch,"network_mode":"DENY","private_network":true}),
                             )
                         }
                     }
@@ -345,6 +400,15 @@ fn handle(request: Request, states: &States) -> Response {
                 })
             })
         }
+        "network_probe" => run_network_probe().map(|probe| {
+            json!({
+                "status": "PROBE_COMPLETED",
+                "probe": probe,
+                "network_mode": "DENY",
+                "private_network": true,
+                "side_effects": true,
+            })
+        }),
         "status" | "kill" | "cleanup" => {
             let handle = request
                 .params
@@ -479,7 +543,7 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{filesystem_policy, resource_limits};
+    use super::{filesystem_policy, network_policy, resource_limits};
     use serde_json::json;
 
     #[test]
@@ -522,5 +586,13 @@ mod tests {
             "UNIT_TEST"
         )
         .is_err());
+    }
+
+    #[test]
+    fn rejects_network_modes_other_than_deny() {
+        assert!(network_policy(&json!({"network_mode": "RESEARCH"})).is_err());
+        assert!(network_policy(&json!({"network_mode": "MODEL_ONLY"})).is_err());
+        assert!(network_policy(&json!({})).is_ok());
+        assert!(network_policy(&json!({"network_mode": "DENY"})).is_ok());
     }
 }

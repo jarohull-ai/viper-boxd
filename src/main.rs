@@ -32,6 +32,7 @@ fn usage() {
     eprintln!("  viper-boxd capabilities");
     eprintln!("  viper-boxd backend-self-test --socket PATH");
     eprintln!("  viper-boxd filesystem-probe --socket PATH");
+    eprintln!("  viper-boxd network-probe --socket PATH");
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
@@ -200,9 +201,9 @@ fn main() -> ExitCode {
             }
             let ttl_test = helper_backend != "mock";
             let spawn_params = if ttl_test {
-                json!({"box_id": selftest_box, "required_backend": [], "ttl_seconds": 2, "sleep_seconds": 30, "cpu_quota_percent": 50, "memory_limit_bytes": 268435456, "filesystem_mode": "STRICT", "write_target": "scratch"})
+                json!({"box_id": selftest_box, "required_backend": [], "ttl_seconds": 2, "sleep_seconds": 30, "cpu_quota_percent": 50, "memory_limit_bytes": 268435456, "filesystem_mode": "STRICT", "write_target": "scratch", "network_mode": "DENY"})
             } else {
-                json!({"box_id": selftest_box, "required_backend": [], "cpu_quota_percent": 50, "memory_limit_bytes": 268435456, "filesystem_mode": "STRICT", "write_target": "scratch"})
+                json!({"box_id": selftest_box, "required_backend": [], "cpu_quota_percent": 50, "memory_limit_bytes": 268435456, "filesystem_mode": "STRICT", "write_target": "scratch", "network_mode": "DENY"})
             };
             let spawn = send_request(&socket, &request("req-2", "spawn", spawn_params))
                 .map_err(|error| error.to_string())?;
@@ -289,6 +290,34 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("filesystem probe error: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if args.get(1).map(String::as_str) == Some("network-probe") {
+        let socket =
+            arg_value(&args[2..], "--socket").unwrap_or_else(|| "/tmp/viper-helper.sock".into());
+        let request = Request {
+            version: IPC_VERSION.into(),
+            request_id: format!("network-probe-{}", std::process::id()),
+            method: "network_probe".into(),
+            params: json!({}),
+        };
+        match send_request(&socket, &request) {
+            Ok(response) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response)
+                        .expect("JSON serialization cannot fail")
+                );
+                return if response.ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                };
+            }
+            Err(error) => {
+                eprintln!("network probe error: {error}");
                 return ExitCode::from(2);
             }
         }

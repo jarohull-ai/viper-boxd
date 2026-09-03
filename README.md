@@ -123,6 +123,25 @@ unit. It is a verification probe, not a general command runner. A successful
 probe demonstrates this tested policy on the current host; it is not a claim
 that the future privileged runner is complete or independently audited.
 
+### Network-deny probe
+
+The helper enforces `network_mode: DENY` for its current systemd test unit by
+setting `PrivateNetwork=yes`. The fixed network probe verifies both an external
+address and a loopback address, without accepting a URL or command from the
+caller:
+
+```bash
+cargo build --bins
+cargo run --bin viper-helper -- /tmp/viper-helper.sock
+cargo run -- network-probe --socket /tmp/viper-helper.sock
+```
+
+The expected result contains `external_network_blocked: true` and
+`local_network_blocked: true`. Other network modes are rejected fail-closed;
+gateway mediation is not implemented yet. In particular, this mode also
+blocks access to local Ollama/OpenClaw endpoints until a dedicated gateway is
+introduced.
+
 ## Backend decision
 
 The planned first real backend is a separate `viper-helper` system service
