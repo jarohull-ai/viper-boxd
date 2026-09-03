@@ -162,6 +162,16 @@ fn main() -> ExitCode {
             };
             let capabilities = send_request(&socket, &request("req-0", "capabilities", json!({})))
                 .map_err(|error| error.to_string())?;
+            if !capabilities.ok
+                || capabilities
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("schema"))
+                    .and_then(|schema| schema.as_str())
+                    != Some("viper-boxd.capabilities.v0")
+            {
+                return Err("helper returned an invalid capabilities response".into());
+            }
             let refused = send_request(
                 &socket,
                 &request(
