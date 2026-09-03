@@ -1,0 +1,10 @@
+schema = "viper-boxd.profile.v0"
+profile_id = "RESEARCH_READONLY_V1"
+network_mode = "RESEARCH"
+direct_network = "DENY"
+allowed_gateways = ["MODEL:VIPER_LOCAL_OLLAMA_V1", "RESEARCH:PUBLIC_WEB_READONLY_V1"]
+tool_bindings = ["MODEL_GENERATE->MODEL:VIPER_LOCAL_OLLAMA_V1", "SEARCH->RESEARCH:PUBLIC_WEB_READONLY_V1", "FETCH->RESEARCH:PUBLIC_WEB_READONLY_V1"]
+required_backend = ["mount_namespace", "network_policy", "cgroup_limits"]
+write_target = "scratch"
+execution_ttl_seconds = 300
+memory_limit_bytes = 1073741824

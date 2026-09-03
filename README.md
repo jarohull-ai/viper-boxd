@@ -1,9 +1,9 @@
 # viper-boxd
 
-**Trusted execution daemon for JFP Box policies — design phase**
+**Trusted execution daemon for JFP Box policies — simulator phase**
 
-> This repository is private by design. It contains architecture and planning
-> material for the future runtime layer; it is not an executable sandbox yet.
+> This repository is private by design. The current binary is an unprivileged
+> simulator; it is not an executable sandbox or runtime yet.
 
 ## Purpose
 
@@ -43,9 +43,25 @@ daemon owns the mapping from logical `workspace_id` and `profile_id` to trusted
 host configuration. Agents never provide host paths, capabilities, ports, or
 backend arguments.
 
+## Simulator quick start
+
+```bash
+cargo run -- plan \
+  --manifest examples/research.jfp \
+  --profile examples/research-profile.toml \
+  --workspace-id WORKSPACE_A
+```
+
+The command validates the manifest through `jfp-box`, compares it with the
+trusted TOML profile, and prints a JSON isolation plan. It performs no mounts,
+namespace changes, network operations, process spawns, or workspace writes.
+
+Exit codes are `0` for `PLAN_ACCEPTED`, `1` for a rejected plan, and `2` for
+CLI, file, or profile errors.
+
 ## Status
 
-Design-only, private, pre-alpha. See [ARCHITECTURE.md](ARCHITECTURE.md),
+Working unprivileged simulator, private, pre-alpha. See [ARCHITECTURE.md](ARCHITECTURE.md),
 [THREAT_MODEL.md](THREAT_MODEL.md), [ROADMAP.md](ROADMAP.md), and
 [PROJECT_PLAN.md](PROJECT_PLAN.md).
 
