@@ -72,6 +72,17 @@ The result deliberately reports `backend_ready: false` and
 `enforceable: false`. Presence is not proof that a future privileged backend
 can enforce an isolation control; that requires backend-specific verification.
 
+## No-op backend self-test
+
+The contract lifecycle can be exercised without system privileges:
+
+```bash
+cargo run -- backend-self-test
+```
+
+This uses an in-memory backend to test `SPAWN`, `KILL`, and `CLEANUP`. It does
+not create a process, namespace, mount, cgroup, or network connection.
+
 ## Status
 
 Working unprivileged simulator, private, pre-alpha. See [ARCHITECTURE.md](ARCHITECTURE.md),

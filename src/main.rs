@@ -1,4 +1,5 @@
 mod capabilities;
+mod noop_backend;
 
 use jfp_box::{parse_manifest, sha256_hex, validate};
 use serde::Deserialize;
@@ -26,6 +27,7 @@ fn usage() {
     eprintln!("Usage:");
     eprintln!("  viper-boxd plan --manifest FILE --profile FILE --workspace-id ID [--json]");
     eprintln!("  viper-boxd capabilities");
+    eprintln!("  viper-boxd backend-self-test");
 }
 
 fn arg_value(args: &[String], name: &str) -> Option<String> {
@@ -146,6 +148,45 @@ fn main() -> ExitCode {
                 .expect("JSON serialization cannot fail")
         );
         return ExitCode::SUCCESS;
+    }
+    if args.get(1).map(String::as_str) == Some("backend-self-test") {
+        let mut backend = noop_backend::NoopBackend::new();
+        let spec = noop_backend::BackendSpec {
+            box_id: "SELFTEST_BOX".into(),
+            task_id: "SELFTEST_TASK".into(),
+            workspace_id: "SELFTEST_WORKSPACE".into(),
+            profile_id: "SELFTEST_PROFILE".into(),
+            audit_trace_id: "SELFTEST_TRACE".into(),
+        };
+        let result = (|| {
+            let handle = backend.spawn(&spec).map_err(|error| error.to_string())?;
+            let running = backend.status(&handle).map_err(|error| error.to_string())?;
+            backend.kill(&handle).map_err(|error| error.to_string())?;
+            let status = backend
+                .cleanup(&handle)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(json!({
+                "schema": "viper-boxd.backend.self_test.v0",
+                "execution_mode": "NOOP_IN_MEMORY",
+                "side_effects": false,
+                "handle": handle.as_str(),
+                "running_status": format!("{running:?}"),
+                "final_status": format!("{status:?}")
+            }))
+        })();
+        match result {
+            Ok(output) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&output).expect("JSON serialization cannot fail")
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => {
+                eprintln!("backend self-test error: {error}");
+                return ExitCode::from(2);
+            }
+        }
     }
     if args.get(1).map(String::as_str) != Some("plan") {
         usage();
