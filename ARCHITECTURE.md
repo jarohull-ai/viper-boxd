@@ -6,6 +6,11 @@ The daemon is a small, privileged control-plane component. It receives only
 logical identifiers and a validator result. Trusted configuration is loaded
 from an administrator-controlled directory; it is never supplied by an agent.
 
+The resulting policy, enforcement, and audit boundaries can support technical
+evidence for teams with governance or regulatory obligations. They do not by
+themselves determine those obligations or make a deployment compliant; that
+depends on the system's intended use, deployment context, and operator role.
+
 ## Planned components
 
 1. **IPC/API boundary** — authenticated requests containing `task_id`,

@@ -35,6 +35,12 @@ viper-boxd (trusted control boundary)
     └── audit records
 ```
 
+For teams operating AI-enabled systems in regulated settings, these runtime
+controls and audit records can support technical evidence of how a task was
+constrained and handled. viper-boxd is not a compliance product, legal
+assessment, or certification; applicable obligations depend on the system's
+intended use and the organization deploying it.
+
 ## Non-goals for the design phase
 
 - no agent execution;
