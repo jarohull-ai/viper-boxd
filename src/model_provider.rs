@@ -1,7 +1,7 @@
 use crate::research_policy::PolicyViolation;
 use reqwest::{blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::time::Duration;
 
 #[derive(Debug, Serialize)]
@@ -219,6 +219,142 @@ pub fn generate_stream(
         max_stream_duration_seconds,
         on_delta,
     )
+}
+
+struct SseDelta {
+    delta: String,
+    done: bool,
+}
+
+/// Shared by `openai` and `openrouter`: both stream Chat Completions as
+/// Server-Sent Events, `data: {...}` lines terminated by a literal
+/// `data: [DONE]` line (verified against OpenAI's and OpenRouter's own
+/// published streaming docs, not assumed). OpenRouter adds two things
+/// OpenAI's format doesn't have, both handled here: `:`-prefixed keep-alive
+/// comment lines (skipped, never parsed as JSON) and mid-stream failures
+/// delivered as a JSON event carrying a top-level `error` field instead of
+/// a `delta` (surfaced as a stream failure, not a delta).
+pub struct OpenAiCompatibleStreamTransport {
+    pub api_key: String,
+}
+
+impl ModelStreamTransport for OpenAiCompatibleStreamTransport {
+    fn generate_stream(
+        &self,
+        endpoint: &str,
+        model: &str,
+        prompt: &str,
+        max_output_tokens: u32,
+        idle_timeout_seconds: u64,
+        max_stream_duration_seconds: u64,
+        on_delta: &mut dyn FnMut(&str, bool),
+    ) -> Result<(), PolicyViolation> {
+        let endpoint = endpoint.to_owned();
+        let model_owned = model.to_owned();
+        let prompt = prompt.to_owned();
+        let api_key = self.api_key.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<SseDelta, String>>();
+
+        std::thread::spawn(move || {
+            let outcome = (|| -> Result<(), String> {
+                let client = Client::builder()
+                    .redirect(Policy::none())
+                    .no_proxy()
+                    .timeout(Duration::from_secs(max_stream_duration_seconds))
+                    .user_agent("viper-model-gateway/0.1")
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
+                let response = client
+                    .post(url)
+                    .bearer_auth(&api_key)
+                    .json(&json!({
+                        "model": model_owned,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_output_tokens,
+                        "stream": true,
+                    }))
+                    .send()
+                    .map_err(|e| e.to_string())?;
+                if !response.status().is_success() {
+                    return Err(format!("model provider returned HTTP {}", response.status()));
+                }
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(response).lines() {
+                    let line = line.map_err(|e| e.to_string())?;
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with(':') {
+                        continue; // blank event separator or an OpenRouter keep-alive comment
+                    }
+                    let Some(data) = trimmed.strip_prefix("data:") else {
+                        continue; // ignore any other SSE field (event:, id:, retry:, ...)
+                    };
+                    let data = data.trim();
+                    if data == "[DONE]" {
+                        let _ = tx.send(Ok(SseDelta {
+                            delta: String::new(),
+                            done: true,
+                        }));
+                        return Ok(());
+                    }
+                    let parsed: Value = serde_json::from_str(data).map_err(|e| e.to_string())?;
+                    if let Some(error_obj) = parsed.get("error") {
+                        let message = error_obj
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("provider reported a stream error")
+                            .to_owned();
+                        return Err(message);
+                    }
+                    let delta = parsed
+                        .get("choices")
+                        .and_then(|choices| choices.get(0))
+                        .and_then(|choice| choice.get("delta"))
+                        .and_then(|delta| delta.get("content"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    if tx
+                        .send(Ok(SseDelta {
+                            delta,
+                            done: false,
+                        }))
+                        .is_err()
+                    {
+                        return Ok(()); // receiver gave up (idle timeout); stop reading
+                    }
+                }
+                Err("stream ended before a [DONE] line".into())
+            })();
+            if let Err(message) = outcome {
+                let _ = tx.send(Err(message));
+            }
+        });
+
+        loop {
+            match rx.recv_timeout(Duration::from_secs(idle_timeout_seconds)) {
+                Ok(Ok(event)) => {
+                    on_delta(&event.delta, event.done);
+                    if event.done {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(message)) => return Err(violation("ERR_MODEL_FAILED", message)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(violation(
+                        "ERR_MODEL_FAILED",
+                        format!("no chunk received within {idle_timeout_seconds}s (idle timeout)"),
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(violation(
+                        "ERR_MODEL_RESPONSE_INVALID",
+                        "stream ended unexpectedly",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// Shared by the `openai` and `openrouter` providers: OpenRouter's API is a

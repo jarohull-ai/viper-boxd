@@ -10,7 +10,7 @@ use viper_boxd::{
     ipc::{ipc_error as error, respond as response, stream_chunk, Request, Response, IPC_VERSION},
     model_provider::{
         self, AnthropicTransport, OllamaEmbedTransport, OllamaStreamTransport, OllamaTransport,
-        OpenAiCompatibleEmbedTransport, OpenAiCompatibleTransport,
+        OpenAiCompatibleEmbedTransport, OpenAiCompatibleStreamTransport, OpenAiCompatibleTransport,
     },
 };
 
@@ -86,8 +86,10 @@ impl GatewayConfig {
             }
         }
         if let Some(stream) = &config.stream {
-            if config.provider != "ollama" {
-                return Err("streaming is only implemented for provider ollama".into());
+            if config.provider == "anthropic" {
+                return Err(
+                    "streaming is not yet implemented for provider anthropic".into(),
+                );
             }
             if stream.idle_timeout_seconds == 0 || stream.max_stream_duration_seconds == 0 {
                 return Err("stream config contains empty or zero policy values".into());
@@ -287,6 +289,7 @@ fn serve_stream(
     request: Request,
     config: &GatewayConfig,
     remaining: &AtomicU32,
+    api_key: Option<&str>,
 ) -> std::io::Result<()> {
     let request_id = request.request_id;
 
@@ -348,10 +351,20 @@ fn serve_stream(
         }
     };
 
+    let transport: Box<dyn model_provider::ModelStreamTransport> = match config.provider.as_str() {
+        "ollama" => Box::new(OllamaStreamTransport),
+        "openai" | "openrouter" => Box::new(OpenAiCompatibleStreamTransport {
+            api_key: api_key
+                .expect("keyed provider validated at config load")
+                .to_owned(),
+        }),
+        other => unreachable!("provider {other} validated at config load for streaming"),
+    };
+
     let mut sequence: u64 = 0;
     let mut io_result: std::io::Result<()> = Ok(());
     let outcome = model_provider::generate_stream(
-        &OllamaStreamTransport,
+        transport.as_ref(),
         &config.endpoint,
         &config.model,
         &prompt,
@@ -406,7 +419,7 @@ fn serve(
     let is_streaming = request.method == "MODEL_GENERATE"
         && request.params.get("stream").and_then(Value::as_bool) == Some(true);
     if is_streaming {
-        return serve_stream(stream, request, config, remaining);
+        return serve_stream(stream, request, config, remaining, api_key);
     }
 
     let reply = handle(request, config, remaining, api_key);
@@ -583,10 +596,18 @@ mod tests {
     }
 
     #[test]
-    fn stream_table_rejected_for_a_non_ollama_provider() {
-        let path = "/tmp/viper-stream-non-ollama.toml";
-        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='openai'\nendpoint='https://api.openai.com/v1'\nmodel='m'\napi_key_env='X'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n[stream]\nidle_timeout_seconds=5\nmax_stream_duration_seconds=30\n").unwrap();
+    fn stream_table_rejected_for_anthropic() {
+        let path = "/tmp/viper-stream-anthropic.toml";
+        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='anthropic'\nendpoint='https://api.anthropic.com'\nmodel='claude-sonnet-5'\napi_key_env='X'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n[stream]\nidle_timeout_seconds=5\nmax_stream_duration_seconds=30\n").unwrap();
         assert!(GatewayConfig::load(path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stream_table_loads_for_openai() {
+        let path = "/tmp/viper-stream-openai.toml";
+        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='openai'\nendpoint='https://api.openai.com/v1'\nmodel='gpt-4o-mini'\napi_key_env='X'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n[stream]\nidle_timeout_seconds=5\nmax_stream_duration_seconds=30\n").unwrap();
+        assert!(GatewayConfig::load(path).is_ok());
         let _ = std::fs::remove_file(path);
     }
 

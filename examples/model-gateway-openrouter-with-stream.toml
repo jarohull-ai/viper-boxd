@@ -1,0 +1,17 @@
+schema = "viper-boxd.model-gateway.v0"
+gateway_id = "OPENROUTER_V1"
+provider = "openrouter"
+endpoint = "https://openrouter.ai/api/v1"
+model = "openai/gpt-4o-mini"
+api_key_env = "OPENROUTER_API_KEY"
+max_requests = 30
+max_prompt_chars = 8000
+max_output_tokens = 256
+timeout_seconds = 30
+
+# STREAM is opt-in, same pattern as [embed]. OpenRouter's stream adds
+# ":"-prefixed keep-alive comment lines and a trailing usage chunk before
+# data: [DONE]; both are handled transparently (STREAM_PLAN.md).
+[stream]
+idle_timeout_seconds = 15
+max_stream_duration_seconds = 60
