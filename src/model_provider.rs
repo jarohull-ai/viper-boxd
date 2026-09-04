@@ -450,6 +450,151 @@ impl ModelTransport for AnthropicTransport {
     }
 }
 
+/// Anthropic's SSE stream pairs an `event: <type>` line with a `data:
+/// {...}` line, but every payload's own JSON also carries that same type
+/// in a `"type"` field (verified against Anthropic's published streaming
+/// docs) — so the parser only needs to read `data:` lines and switch on
+/// that field, the same shape as the OpenAI-compatible parser, without
+/// tracking the separate `event:` line at all. Termination is the
+/// `message_stop` event, not a `[DONE]` sentinel; a `content_block_delta`
+/// only carries text when its own `delta.type` is `"text_delta"` (a plain
+/// `MODEL_GENERATE` call never requests tools or extended thinking, so the
+/// other delta types are skipped defensively rather than erroring). A
+/// mid-stream failure is its own `event: error` / `data: {"type":
+/// "error", ...}` pair, not a field on some other event.
+pub struct AnthropicStreamTransport {
+    pub api_key: String,
+}
+
+impl ModelStreamTransport for AnthropicStreamTransport {
+    fn generate_stream(
+        &self,
+        endpoint: &str,
+        model: &str,
+        prompt: &str,
+        max_output_tokens: u32,
+        idle_timeout_seconds: u64,
+        max_stream_duration_seconds: u64,
+        on_delta: &mut dyn FnMut(&str, bool),
+    ) -> Result<(), PolicyViolation> {
+        let endpoint = endpoint.to_owned();
+        let model_owned = model.to_owned();
+        let prompt = prompt.to_owned();
+        let api_key = self.api_key.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<SseDelta, String>>();
+
+        std::thread::spawn(move || {
+            let outcome = (|| -> Result<(), String> {
+                let client = Client::builder()
+                    .redirect(Policy::none())
+                    .no_proxy()
+                    .timeout(Duration::from_secs(max_stream_duration_seconds))
+                    .user_agent("viper-model-gateway/0.1")
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let url = format!("{}/v1/messages", endpoint.trim_end_matches('/'));
+                let response = client
+                    .post(url)
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&json!({
+                        "model": model_owned,
+                        "max_tokens": max_output_tokens,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": true,
+                    }))
+                    .send()
+                    .map_err(|e| e.to_string())?;
+                if !response.status().is_success() {
+                    return Err(format!("model provider returned HTTP {}", response.status()));
+                }
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(response).lines() {
+                    let line = line.map_err(|e| e.to_string())?;
+                    let trimmed = line.trim();
+                    let Some(data) = trimmed.strip_prefix("data:") else {
+                        continue; // event: lines, blank separators, anything else
+                    };
+                    let parsed: Value = serde_json::from_str(data.trim()).map_err(|e| e.to_string())?;
+                    let event_type = parsed.get("type").and_then(Value::as_str).unwrap_or("");
+                    match event_type {
+                        "message_stop" => {
+                            let _ = tx.send(Ok(SseDelta {
+                                delta: String::new(),
+                                done: true,
+                            }));
+                            return Ok(());
+                        }
+                        "error" => {
+                            let message = parsed
+                                .get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("provider reported a stream error")
+                                .to_owned();
+                            return Err(message);
+                        }
+                        "content_block_delta" => {
+                            let is_text = parsed
+                                .get("delta")
+                                .and_then(|d| d.get("type"))
+                                .and_then(Value::as_str)
+                                == Some("text_delta");
+                            if !is_text {
+                                continue; // input_json_delta / thinking_delta / signature_delta
+                            }
+                            let delta = parsed
+                                .get("delta")
+                                .and_then(|d| d.get("text"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_owned();
+                            if tx
+                                .send(Ok(SseDelta {
+                                    delta,
+                                    done: false,
+                                }))
+                                .is_err()
+                            {
+                                return Ok(()); // receiver gave up (idle timeout); stop reading
+                            }
+                        }
+                        _ => continue, // message_start, content_block_start/stop, message_delta, ping
+                    }
+                }
+                Err("stream ended before a message_stop event".into())
+            })();
+            if let Err(message) = outcome {
+                let _ = tx.send(Err(message));
+            }
+        });
+
+        loop {
+            match rx.recv_timeout(Duration::from_secs(idle_timeout_seconds)) {
+                Ok(Ok(event)) => {
+                    on_delta(&event.delta, event.done);
+                    if event.done {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(message)) => return Err(violation("ERR_MODEL_FAILED", message)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(violation(
+                        "ERR_MODEL_FAILED",
+                        format!("no chunk received within {idle_timeout_seconds}s (idle timeout)"),
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(violation(
+                        "ERR_MODEL_RESPONSE_INVALID",
+                        "stream ended unexpectedly",
+                    ));
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct EmbedResponse {
     pub gateway: &'static str,

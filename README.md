@@ -292,26 +292,26 @@ configs. `anthropic` has no public embeddings API at all — `[embed]` with
 `provider = "anthropic"` is rejected at config load, not left to fail on
 the first real call.
 
-Token-by-token streaming is implemented for `ollama`, `openai`, and
-`openrouter`: `stream: true` as a flag on `MODEL_GENERATE` (not a new
-method — every real provider models it this way), a new `StreamChunk`
-frame sequence over the same JSON-lines Unix socket, and an idle-chunk
-timeout plus an absolute max-stream-duration cap a one-shot request never
-needed. `Response` and `send_request` are untouched; every non-streaming
-caller keeps working exactly as before. `openai`/`openrouter` stream as
-Server-Sent Events (`data: {...}` lines ending in a literal `data:
-[DONE]`), verified against each provider's own published streaming docs
-before writing a parser — including OpenRouter's `:`-prefixed keep-alive
-comments and its mid-stream `error`-field failure shape. `anthropic`
-streaming is explicitly not implemented (different, typed SSE events) and
-`[stream]` with `provider = "anthropic"` is rejected at config load. Full
-design and verification results are in [STREAM_PLAN.md](STREAM_PLAN.md).
+Token-by-token streaming is implemented for all four providers: `stream:
+true` as a flag on `MODEL_GENERATE` (not a new method — every real
+provider models it this way), a new `StreamChunk` frame sequence over the
+same JSON-lines Unix socket, and an idle-chunk timeout plus an absolute
+max-stream-duration cap a one-shot request never needed. `Response` and
+`send_request` are untouched; every non-streaming caller keeps working
+exactly as before. `openai`/`openrouter` stream as Server-Sent Events
+(`data: {...}` lines ending in a literal `data: [DONE]`), including
+OpenRouter's `:`-prefixed keep-alive comments and its mid-stream
+`error`-field failure shape. `anthropic` streams typed SSE events
+(`event: content_block_delta`/`message_stop`, no `[DONE]` sentinel) — a
+genuinely different parser, verified against Anthropic's own published
+streaming example before writing it. Full design and verification results
+are in [STREAM_PLAN.md](STREAM_PLAN.md).
 
 ```bash
 ollama pull mistral:7b
 cargo run --bin viper-model-gateway -- /tmp/viper-model-gateway.sock \
   examples/model-gateway-with-stream.toml
-# or: examples/model-gateway-openai-with-stream.toml / -openrouter-with-stream.toml
+# or examples/model-gateway-{openai,anthropic,openrouter}-with-stream.toml
 ```
 
 A client sends `MODEL_GENERATE` with `"params": {"prompt": "...", "stream":

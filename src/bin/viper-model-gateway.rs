@@ -9,8 +9,9 @@ use std::{
 use viper_boxd::{
     ipc::{ipc_error as error, respond as response, stream_chunk, Request, Response, IPC_VERSION},
     model_provider::{
-        self, AnthropicTransport, OllamaEmbedTransport, OllamaStreamTransport, OllamaTransport,
-        OpenAiCompatibleEmbedTransport, OpenAiCompatibleStreamTransport, OpenAiCompatibleTransport,
+        self, AnthropicStreamTransport, AnthropicTransport, OllamaEmbedTransport,
+        OllamaStreamTransport, OllamaTransport, OpenAiCompatibleEmbedTransport,
+        OpenAiCompatibleStreamTransport, OpenAiCompatibleTransport,
     },
 };
 
@@ -86,11 +87,6 @@ impl GatewayConfig {
             }
         }
         if let Some(stream) = &config.stream {
-            if config.provider == "anthropic" {
-                return Err(
-                    "streaming is not yet implemented for provider anthropic".into(),
-                );
-            }
             if stream.idle_timeout_seconds == 0 || stream.max_stream_duration_seconds == 0 {
                 return Err("stream config contains empty or zero policy values".into());
             }
@@ -358,6 +354,11 @@ fn serve_stream(
                 .expect("keyed provider validated at config load")
                 .to_owned(),
         }),
+        "anthropic" => Box::new(AnthropicStreamTransport {
+            api_key: api_key
+                .expect("keyed provider validated at config load")
+                .to_owned(),
+        }),
         other => unreachable!("provider {other} validated at config load for streaming"),
     };
 
@@ -596,10 +597,10 @@ mod tests {
     }
 
     #[test]
-    fn stream_table_rejected_for_anthropic() {
+    fn stream_table_loads_for_anthropic() {
         let path = "/tmp/viper-stream-anthropic.toml";
         std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='anthropic'\nendpoint='https://api.anthropic.com'\nmodel='claude-sonnet-5'\napi_key_env='X'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n[stream]\nidle_timeout_seconds=5\nmax_stream_duration_seconds=30\n").unwrap();
-        assert!(GatewayConfig::load(path).is_err());
+        assert!(GatewayConfig::load(path).is_ok());
         let _ = std::fs::remove_file(path);
     }
 

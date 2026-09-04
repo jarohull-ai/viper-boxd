@@ -1,0 +1,17 @@
+schema = "viper-boxd.model-gateway.v0"
+gateway_id = "ANTHROPIC_CLAUDE_V1"
+provider = "anthropic"
+endpoint = "https://api.anthropic.com"
+model = "claude-sonnet-5"
+api_key_env = "ANTHROPIC_API_KEY"
+max_requests = 30
+max_prompt_chars = 8000
+max_output_tokens = 256
+timeout_seconds = 30
+
+# STREAM is opt-in, same pattern as [embed]. Anthropic's stream uses typed
+# SSE events (content_block_delta / message_stop), not a [DONE] sentinel;
+# see STREAM_PLAN.md.
+[stream]
+idle_timeout_seconds = 15
+max_stream_duration_seconds = 60

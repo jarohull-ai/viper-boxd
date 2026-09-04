@@ -112,13 +112,20 @@ handles, confirmed from their docs:
 `[stream]` for `openai`/`openrouter` requires `api_key_env`, same as their
 non-streaming `MODEL_GENERATE` and `EMBED`.
 
-### Anthropic — still out of scope
+### Anthropic — implemented
 
-Anthropic's streaming uses typed SSE events (`content_block_delta`,
-`message_stop`, etc.) rather than OpenAI's single implicit delta-per-event
-shape — a genuinely different parser, not a variant of the one above.
-`[stream]` with `provider = "anthropic"` is rejected at config load with a
-clear message, not silently accepted and left to fail per-call.
+Anthropic's streaming uses typed SSE events (`event: <type>` paired with
+`data: {...}`) rather than OpenAI's single implicit delta-per-event shape —
+verified against Anthropic's own published streaming reference before
+writing a parser, including their full worked example. The payload's own
+`"type"` field always duplicates the `event:` line's type, so
+`AnthropicStreamTransport` only reads `data:` lines and switches on that
+field, without tracking `event:` separately — same overall shape as the
+OpenAI-compatible parser. `message_stop` is the terminator (no `[DONE]`
+sentinel); a `content_block_delta` only yields text when its own
+`delta.type` is `text_delta` (tool-use/thinking delta types are skipped,
+since a plain `MODEL_GENERATE` call never triggers them); `event: error` is
+a distinct mid-stream failure event, not a field on some other event type.
 
 ## Policy changes streaming requires
 
@@ -212,7 +219,7 @@ call — carried in the final chunk's `error` field instead of a top-level
   even with a much longer idle timeout configured, confirming that cap is
   a real backstop and not merely config-validated.
 
-## Verified: OpenAI/OpenRouter SSE parsing against real wire bytes
+## Verified: SSE parsing against real wire bytes
 
 `tests/openai_compatible_stream.rs` runs `OpenAiCompatibleStreamTransport`
 against deliberately crafted raw TCP servers sending realistic SSE bytes,
@@ -222,15 +229,21 @@ delivery ending at a literal `data: [DONE]` line; OpenRouter's `:`-prefixed
 keep-alive comments correctly skipped; a mid-stream `error` event failing
 the call with no further deltas delivered; malformed JSON in a `data:`
 line failing the call; a connection that closes before `[DONE]` failing
-the call rather than silently succeeding. Not yet done: a live call
-against the real OpenAI/OpenRouter APIs with `stream: true` (needs an
-operator-supplied key, same constraint as every other live-key
-verification this session).
+the call rather than silently succeeding.
+
+`tests/anthropic_stream.rs` does the same for `AnthropicStreamTransport`,
+using bytes taken directly from Anthropic's own "Full HTTP stream response"
+documentation example (including the `ping` keep-alive event and the full
+`message_start` → `content_block_delta` → `message_stop` sequence), plus
+crafted cases for a mid-stream `event: error`, a non-`text_delta` content
+block delta (tool use), and a connection closing before `message_stop`.
+
+Not yet done for either: a live call against the real APIs with `stream:
+true` (needs an operator-supplied key, same constraint as every other
+live-key verification this session).
 
 ## Explicitly out of scope here
 
-- Anthropic streaming (typed SSE events, a genuinely different parser —
-  see "Provider staging" above);
 - streaming for `EMBED` (embeddings are not sequential — there is nothing
   to stream);
 - streaming for `SEARCH` or `FETCH`;
