@@ -2,8 +2,16 @@
 
 **Trusted execution daemon for JFP Box policies — simulator phase**
 
-> This repository is private by design. The current binary is an unprivileged
-> simulator; it is not an executable sandbox or runtime yet.
+> **Alpha. Not for production. No independent security review has been
+> performed.** This is an unprivileged simulator and a set of trusted-daemon
+> prototypes (`viper-helper`, the research and model gateways); it is not an
+> audited sandbox or runtime. Every isolation and gateway-security claim in
+> this repository is backed by automated tests and, where noted, manual live
+> verification on one development host — not by third-party review.
+> `BACKEND_DECISION.md` and `KNOWN_LIMITATIONS.md` list what is deliberately
+> not yet done, including the independent security review required before
+> any real agent execution. Feedback, issues, and bug reports are welcome
+> via GitHub Issues; see [Contact](#contact) for direct contact.
 
 ## Purpose
 
@@ -331,7 +339,7 @@ No privileged runner has been implemented yet.
 
 ## Status
 
-Working unprivileged simulator, private, pre-alpha. See [ARCHITECTURE.md](ARCHITECTURE.md),
+Working unprivileged simulator, source-available, alpha. See [ARCHITECTURE.md](ARCHITECTURE.md),
 [THREAT_MODEL.md](THREAT_MODEL.md), [ROADMAP.md](ROADMAP.md),
 [PROJECT_PLAN.md](PROJECT_PLAN.md), and [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
 for trade-offs confirmed real but deliberately left unfixed at this stage.

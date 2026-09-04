@@ -1,10 +1,11 @@
 [package]
 name = "viper-boxd"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
 description = "Unprivileged simulator for the viper-boxd trusted runner"
 license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/jarohull-ai/viper-boxd"
+readme = "README.md"
 
 [dependencies]
 jfp-box = "0.4.1"
