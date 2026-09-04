@@ -187,7 +187,17 @@ integration already wired into `viper-helper`.
   canned responses — done for both methods: `MODEL_GENERATE` against
   `mistral:7b`, `EMBED` against `nomic-embed-text` (a model with no
   declared `embedding` capability, e.g. `mistral:7b`, fails per-call with
-  `ERR_EMBED_FAILED` rather than at gateway startup).
+  `ERR_EMBED_FAILED` rather than at gateway startup);
+- `openai`, `anthropic`, and `openrouter` verified live against their real
+  APIs with operator-supplied keys: `openrouter` returned a real completion
+  (`MODEL_OUTPUT`, correct `model` field); `openai` returned a real HTTP 429
+  (rate/quota limited on that key) mapped to `ERR_MODEL_FAILED`; `anthropic`
+  returned a real HTTP 400, root-caused via a direct `curl` against the same
+  endpoint to an insufficient-credit account error, not a request-shape bug
+  — confirming the request format, auth headers, and error mapping are all
+  correct for a provider whose only live response available was a failure.
+  Test keys were provided for this verification only, meant to be rotated
+  by the operator immediately afterward.
 
 ## Explicitly out of scope here
 
