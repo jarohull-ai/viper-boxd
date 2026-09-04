@@ -284,6 +284,13 @@ cargo run --bin viper-model-gateway -- /tmp/viper-model-gateway.sock \
   examples/model-gateway-with-embed.toml
 ```
 
+Token-by-token streaming is planned but not implemented: the current IPC
+contract is one request to exactly one response per line, which real
+streaming output needs to change. The design — `stream: true` as a flag on
+`MODEL_GENERATE` rather than a new method, the new frame format, and why
+Ollama is staged before the SSE-based providers — is documented in
+[STREAM_PLAN.md](STREAM_PLAN.md).
+
 ## Backend decision
 
 The planned first real backend is a separate `viper-helper` system service
