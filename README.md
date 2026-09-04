@@ -245,15 +245,14 @@ empty key variable is a startup error, not a silently disabled feature.
 ### Model gateway
 
 A separate gateway process and socket, matching the `MODEL:*` gateway
-namespace manifests already reference (`VIPER_LOCAL_OLLAMA_V1`). Its design,
-including why streaming is explicitly out of scope for now, is documented
-in [MODEL_GATEWAY_PLAN.md](MODEL_GATEWAY_PLAN.md). Four providers are
-supported — `ollama` (local, no key), and keyed `openai`, `anthropic`, and
-`openrouter` (each reads its API key from an `api_key_env`-named
-environment variable at startup, same pattern as Brave Search). Each
-provider runs as its own gateway process; `examples/model-gateway-openai.toml`,
-`examples/model-gateway-anthropic.toml`, and `examples/model-gateway-openrouter.toml`
-are ready-to-run configs.
+namespace manifests already reference (`VIPER_LOCAL_OLLAMA_V1`). Its design
+is documented in [MODEL_GATEWAY_PLAN.md](MODEL_GATEWAY_PLAN.md). Four
+providers are supported — `ollama` (local, no key), and keyed `openai`,
+`anthropic`, and `openrouter` (each reads its API key from an
+`api_key_env`-named environment variable at startup, same pattern as Brave
+Search). Each provider runs as its own gateway process;
+`examples/model-gateway-openai.toml`, `examples/model-gateway-anthropic.toml`,
+and `examples/model-gateway-openrouter.toml` are ready-to-run configs.
 
 ```bash
 cargo build --bins
@@ -283,6 +282,15 @@ ollama pull nomic-embed-text
 cargo run --bin viper-model-gateway -- /tmp/viper-model-gateway.sock \
   examples/model-gateway-with-embed.toml
 ```
+
+`EMBED` is also implemented for `openai` and `openrouter` — one shared
+transport, since OpenRouter's own OpenAPI spec documents the same
+`data[].embedding` response shape OpenAI uses, confirmed rather than
+assumed. `examples/model-gateway-openai-with-embed.toml` and
+`examples/model-gateway-openrouter-with-embed.toml` are ready-to-run
+configs. `anthropic` has no public embeddings API at all — `[embed]` with
+`provider = "anthropic"` is rejected at config load, not left to fail on
+the first real call.
 
 Token-by-token streaming is implemented for `ollama`: `stream: true` as a
 flag on `MODEL_GENERATE` (not a new method — every real provider models it

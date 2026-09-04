@@ -78,9 +78,14 @@ key is read once at gateway startup and held only in the gateway process's
 own memory; it is never written to a config file, logged, or returned to a
 caller.
 
-`EMBED` remains `ollama`-only for now: OpenAI and OpenRouter both offer a
-real embeddings endpoint and are natural next candidates behind the same
-`EmbedTransport` seam, but adding them was out of scope for this round.
+`EMBED` is implemented for `ollama`, `openai`, and `openrouter`.
+`OpenAiCompatibleEmbedTransport` (`POST {endpoint}/embeddings`, Bearer auth)
+serves both `openai` and `openrouter`: OpenRouter's published OpenAPI spec
+documents the same `data[].embedding` response shape as OpenAI's, not
+merely an approximation, so one transport and one parser cover both,
+mirroring `OpenAiCompatibleTransport` for `MODEL_GENERATE`. `anthropic` has
+no public embeddings API at all — `[embed]` with `provider = "anthropic"`
+is rejected at config load, not left to fail per-call or silently ignored.
 Anthropic has no public embeddings API at all.
 
 ## Configuration
@@ -201,12 +206,16 @@ integration already wired into `viper-helper`.
 
 ## Explicitly out of scope here
 
-- any streaming transport;
+- streaming for `openai`, `anthropic`, and `openrouter` (SSE parsing per
+  provider — non-streaming `MODEL_GENERATE` and `EMBED` are implemented for
+  all three; streaming is implemented for `ollama` only, see
+  [STREAM_PLAN.md](STREAM_PLAN.md));
 - Blackbox, or any other provider whose request/response contract has not
   been confirmed against real documentation (no API shape is guessed here);
-- `EMBED` for `openai` or `openrouter` (both offer a real embeddings
-  endpoint and are natural next candidates behind `EmbedTransport`, but
-  adding them was out of scope for this round);
+- `EMBED` for `anthropic` (no public embeddings API exists to call — this
+  is a real absence, not an unimplemented one, and `[embed]` with
+  `provider = "anthropic"` is rejected at config load rather than left to
+  fail per-call);
 - per-token or per-request cost budgeting (meaningful only for a paid
   provider);
 - adding `EMBED` to the mock gateway (`viper-gateway-mock`).

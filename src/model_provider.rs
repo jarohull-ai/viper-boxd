@@ -371,6 +371,50 @@ impl EmbedTransport for OllamaEmbedTransport {
     }
 }
 
+/// Shared by `openai` and `openrouter`: OpenRouter's own OpenAPI spec
+/// (`POST /embeddings`, `{"model", "input"}` body, `data[].embedding`
+/// response) matches OpenAI's `/v1/embeddings` shape exactly, not merely
+/// approximately, so one transport serves both — mirrors
+/// `OpenAiCompatibleTransport` for `MODEL_GENERATE`.
+pub struct OpenAiCompatibleEmbedTransport {
+    pub api_key: String,
+}
+
+impl EmbedTransport for OpenAiCompatibleEmbedTransport {
+    fn embed(
+        &self,
+        endpoint: &str,
+        model: &str,
+        input: &str,
+        timeout_seconds: u64,
+    ) -> Result<Vec<u8>, PolicyViolation> {
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .timeout(Duration::from_secs(timeout_seconds))
+            .user_agent("viper-model-gateway/0.1")
+            .build()
+            .map_err(|e| violation("ERR_EMBED_FAILED", e.to_string()))?;
+        let url = format!("{}/embeddings", endpoint.trim_end_matches('/'));
+        let response = client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(&json!({"model": model, "input": input}))
+            .send()
+            .map_err(|e| violation("ERR_EMBED_FAILED", e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(violation(
+                "ERR_EMBED_FAILED",
+                format!("embedding provider returned HTTP {}", response.status()),
+            ));
+        }
+        response
+            .bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| violation("ERR_EMBED_FAILED", e.to_string()))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct OllamaResponse {
     response: Option<String>,
@@ -412,6 +456,18 @@ struct AnthropicContentBlock {
 struct OllamaEmbedResponse {
     #[serde(default)]
     embeddings: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbedResponse {
+    #[serde(default)]
+    data: Vec<OpenAiEmbedDatum>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiEmbedDatum {
+    #[serde(default)]
+    embedding: Vec<f32>,
 }
 
 fn validate_prompt(prompt: &str, max_prompt_chars: usize) -> Result<(), PolicyViolation> {
@@ -572,6 +628,39 @@ pub fn embed(
     validate_embed_input(input, max_input_chars)?;
     let body = transport.embed(endpoint, model, input, timeout_seconds)?;
     parse_ollama_embed_response(model, &body)
+}
+
+fn parse_openai_embed_response(model: &str, body: &[u8]) -> Result<EmbedResponse, PolicyViolation> {
+    let parsed: OpenAiEmbedResponse = serde_json::from_slice(body)
+        .map_err(|e| violation("ERR_EMBED_RESPONSE_INVALID", e.to_string()))?;
+    let embedding = parsed
+        .data
+        .into_iter()
+        .next()
+        .map(|datum| datum.embedding)
+        .filter(|embedding| !embedding.is_empty())
+        .ok_or_else(|| violation("ERR_EMBED_RESPONSE_INVALID", "no embedding returned"))?;
+    let dimensions = embedding.len();
+    Ok(EmbedResponse {
+        gateway: "openai-compatible-model-v0",
+        classification: "MODEL_OUTPUT",
+        model: model.to_owned(),
+        embedding,
+        dimensions,
+    })
+}
+
+pub fn embed_openai_compatible(
+    transport: &dyn EmbedTransport,
+    endpoint: &str,
+    model: &str,
+    input: &str,
+    max_input_chars: usize,
+    timeout_seconds: u64,
+) -> Result<EmbedResponse, PolicyViolation> {
+    validate_embed_input(input, max_input_chars)?;
+    let body = transport.embed(endpoint, model, input, timeout_seconds)?;
+    parse_openai_embed_response(model, &body)
 }
 
 fn violation(code: &'static str, message: impl Into<String>) -> PolicyViolation {
@@ -1024,6 +1113,88 @@ mod tests {
                 message: "connection refused".into(),
             }));
             let error = embed(&transport, "http://x", "m", "hi", 1000, 5).unwrap_err();
+            assert_eq!(error.code, "ERR_EMBED_FAILED");
+        }
+    }
+
+    mod embed_openai_compatible {
+        use super::super::{embed_openai_compatible, EmbedTransport, PolicyViolation};
+
+        struct CannedEmbedTransport(Result<Vec<u8>, PolicyViolation>);
+
+        impl EmbedTransport for CannedEmbedTransport {
+            fn embed(
+                &self,
+                _endpoint: &str,
+                _model: &str,
+                _input: &str,
+                _timeout_seconds: u64,
+            ) -> Result<Vec<u8>, PolicyViolation> {
+                match &self.0 {
+                    Ok(body) => Ok(body.clone()),
+                    Err(e) => Err(e.clone()),
+                }
+            }
+        }
+
+        fn must_not_be_called() -> CannedEmbedTransport {
+            CannedEmbedTransport(Err(PolicyViolation {
+                code: "ERR_EMBED_FAILED",
+                message: "must not be called".into(),
+            }))
+        }
+
+        #[test]
+        fn rejects_empty_input_before_any_transport_call() {
+            let error = embed_openai_compatible(&must_not_be_called(), "http://x", "m", "  ", 100, 5)
+                .unwrap_err();
+            assert_eq!(error.code, "ERR_EMBED_INPUT_INVALID");
+        }
+
+        #[test]
+        fn maps_a_canned_successful_response_to_the_documented_shape() {
+            let body = br#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,-0.2,0.3]}],"model":"text-embedding-3-small"}"#.to_vec();
+            let transport = CannedEmbedTransport(Ok(body));
+            let response = embed_openai_compatible(
+                &transport,
+                "http://x",
+                "text-embedding-3-small",
+                "hi",
+                1000,
+                5,
+            )
+            .expect("canned response parses");
+            assert_eq!(response.classification, "MODEL_OUTPUT");
+            assert_eq!(response.model, "text-embedding-3-small");
+            assert_eq!(response.dimensions, 3);
+            assert_eq!(response.embedding, vec![0.1, -0.2, 0.3]);
+        }
+
+        #[test]
+        fn rejects_a_response_with_no_data() {
+            let body = br#"{"object":"list","data":[]}"#.to_vec();
+            let transport = CannedEmbedTransport(Ok(body));
+            let error = embed_openai_compatible(&transport, "http://x", "m", "hi", 1000, 5)
+                .unwrap_err();
+            assert_eq!(error.code, "ERR_EMBED_RESPONSE_INVALID");
+        }
+
+        #[test]
+        fn rejects_malformed_json_from_the_provider() {
+            let transport = CannedEmbedTransport(Ok(b"not json".to_vec()));
+            let error = embed_openai_compatible(&transport, "http://x", "m", "hi", 1000, 5)
+                .unwrap_err();
+            assert_eq!(error.code, "ERR_EMBED_RESPONSE_INVALID");
+        }
+
+        #[test]
+        fn propagates_a_transport_failure_unchanged() {
+            let transport = CannedEmbedTransport(Err(PolicyViolation {
+                code: "ERR_EMBED_FAILED",
+                message: "invalid api key".into(),
+            }));
+            let error = embed_openai_compatible(&transport, "http://x", "m", "hi", 1000, 5)
+                .unwrap_err();
             assert_eq!(error.code, "ERR_EMBED_FAILED");
         }
     }

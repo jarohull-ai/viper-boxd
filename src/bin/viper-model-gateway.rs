@@ -10,7 +10,7 @@ use viper_boxd::{
     ipc::{ipc_error as error, respond as response, stream_chunk, Request, Response, IPC_VERSION},
     model_provider::{
         self, AnthropicTransport, OllamaEmbedTransport, OllamaStreamTransport, OllamaTransport,
-        OpenAiCompatibleTransport,
+        OpenAiCompatibleEmbedTransport, OpenAiCompatibleTransport,
     },
 };
 
@@ -78,6 +78,9 @@ impl GatewayConfig {
             ));
         }
         if let Some(embed) = &config.embed {
+            if config.provider == "anthropic" {
+                return Err("anthropic has no embeddings API; remove [embed]".into());
+            }
             if embed.model.is_empty() || embed.max_input_chars == 0 {
                 return Err("embed config contains empty or zero policy values".into());
             }
@@ -228,18 +231,34 @@ fn handle(
                     .and_then(Value::as_str)
                     .ok_or_else(|| error("ERR_INVALID_REQUEST", "EMBED requires params.input"))
                     .and_then(|input| {
-                        model_provider::embed(
-                            &OllamaEmbedTransport,
-                            &config.endpoint,
-                            &embed_config.model,
-                            input,
-                            embed_config.max_input_chars,
-                            config.timeout_seconds,
-                        )
-                        .map(|result| {
-                            serde_json::to_value(result).expect("embed result serializes")
-                        })
-                        .map_err(|v| error(v.code, v.message))
+                        let result = match config.provider.as_str() {
+                            "ollama" => model_provider::embed(
+                                &OllamaEmbedTransport,
+                                &config.endpoint,
+                                &embed_config.model,
+                                input,
+                                embed_config.max_input_chars,
+                                config.timeout_seconds,
+                            ),
+                            "openai" | "openrouter" => model_provider::embed_openai_compatible(
+                                &OpenAiCompatibleEmbedTransport {
+                                    api_key: api_key
+                                        .expect("keyed provider validated at config load")
+                                        .to_owned(),
+                                },
+                                &config.endpoint,
+                                &embed_config.model,
+                                input,
+                                embed_config.max_input_chars,
+                                config.timeout_seconds,
+                            ),
+                            other => unreachable!("provider {other} validated at config load"),
+                        };
+                        result
+                            .map(|result| {
+                                serde_json::to_value(result).expect("embed result serializes")
+                            })
+                            .map_err(|v| error(v.code, v.message))
                     }),
             }
         }
@@ -494,6 +513,22 @@ mod tests {
             Some("test-key-value".to_owned())
         );
         std::env::remove_var(env_var);
+    }
+
+    #[test]
+    fn embed_table_is_rejected_for_anthropic() {
+        let path = "/tmp/viper-embed-anthropic-model-gateway.toml";
+        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='anthropic'\nendpoint='https://api.anthropic.com'\nmodel='claude-sonnet-5'\napi_key_env='X'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n[embed]\nmodel='m'\nmax_input_chars=1\n").unwrap();
+        assert!(GatewayConfig::load(path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn embed_table_loads_for_openai() {
+        let path = "/tmp/viper-embed-openai-model-gateway.toml";
+        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='openai'\nendpoint='https://api.openai.com/v1'\nmodel='gpt-4o-mini'\napi_key_env='X'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n[embed]\nmodel='text-embedding-3-small'\nmax_input_chars=8000\n").unwrap();
+        assert!(GatewayConfig::load(path).is_ok());
+        let _ = std::fs::remove_file(path);
     }
 
     fn config() -> GatewayConfig {
