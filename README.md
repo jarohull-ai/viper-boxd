@@ -332,8 +332,9 @@ No privileged runner has been implemented yet.
 ## Status
 
 Working unprivileged simulator, private, pre-alpha. See [ARCHITECTURE.md](ARCHITECTURE.md),
-[THREAT_MODEL.md](THREAT_MODEL.md), [ROADMAP.md](ROADMAP.md), and
-[PROJECT_PLAN.md](PROJECT_PLAN.md).
+[THREAT_MODEL.md](THREAT_MODEL.md), [ROADMAP.md](ROADMAP.md),
+[PROJECT_PLAN.md](PROJECT_PLAN.md), and [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
+for trade-offs confirmed real but deliberately left unfixed at this stage.
 
 ## Contact
 

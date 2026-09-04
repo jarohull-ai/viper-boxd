@@ -17,6 +17,9 @@ mock implementation. It does not perform network requests or hold secrets.
   process's umask — a socket left at umask-derived permissions could admit
   any local user or group member as a caller, bypassing `viper-boxd`
   entirely, which matters most for a gateway holding a real provider key.
+  The bind and the chmod are two separate syscalls, not one atomic
+  operation; see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for why that
+  gap is left open at this stage.
 - Every accepted connection gets `ipc::configure_server_stream`'s read/write
   timeout (`SERVER_IO_TIMEOUT`) and every line read on either side of the
   wire is bounded by `ipc::MAX_LINE_BYTES` (`ipc::bind_unix_socket`'s

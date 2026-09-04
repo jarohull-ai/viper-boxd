@@ -161,7 +161,9 @@ limitation: on an idle-timeout return, the background thread is not joined
 running, bounded by the client timeout, and its eventual send to the
 now-unreceived channel is silently dropped. This is a deliberate, documented
 tradeoff, not an oversight: actively cancelling an in-flight blocking HTTP
-request would need lower-level socket control this design doesn't add.
+request would need lower-level socket control this design doesn't add. See
+[KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for what would change this
+assessment.
 
 ## Verified end to end on this host
 

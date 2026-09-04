@@ -83,7 +83,9 @@ network in plaintext on a misconfigured `http://` endpoint, a config typo
 that would ship a real secret in the clear rather than merely fail loudly.
 `ollama`'s `endpoint` is unrestricted (`http://127.0.0.1:11434` by default):
 it is expected to run on an admin-chosen local or private address, not a
-provider requiring a bearer token.
+provider requiring a bearer token. There is deliberately no allowlist of
+specific provider hosts beyond the `https://` requirement — see
+[KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
 
 `EMBED` is implemented for `ollama`, `openai`, and `openrouter`.
 `OpenAiCompatibleEmbedTransport` (`POST {endpoint}/embeddings`, Bearer auth)
