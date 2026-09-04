@@ -223,8 +223,14 @@ empty key variable is a startup error, not a silently disabled feature.
 
 A separate gateway process and socket, matching the `MODEL:*` gateway
 namespace manifests already reference (`VIPER_LOCAL_OLLAMA_V1`). Its design,
-including why streaming and paid providers are explicitly out of scope for
-now, is documented in [MODEL_GATEWAY_PLAN.md](MODEL_GATEWAY_PLAN.md).
+including why streaming is explicitly out of scope for now, is documented
+in [MODEL_GATEWAY_PLAN.md](MODEL_GATEWAY_PLAN.md). Four providers are
+supported — `ollama` (local, no key), and keyed `openai`, `anthropic`, and
+`openrouter` (each reads its API key from an `api_key_env`-named
+environment variable at startup, same pattern as Brave Search). Each
+provider runs as its own gateway process; `examples/model-gateway-openai.toml`,
+`examples/model-gateway-anthropic.toml`, and `examples/model-gateway-openrouter.toml`
+are ready-to-run configs.
 
 ```bash
 cargo build --bins

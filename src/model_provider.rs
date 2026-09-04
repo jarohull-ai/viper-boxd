@@ -68,6 +68,99 @@ impl ModelTransport for OllamaTransport {
     }
 }
 
+/// Shared by the `openai` and `openrouter` providers: OpenRouter's API is a
+/// drop-in-compatible proxy over the same Chat Completions request/response
+/// shape, differing only in `endpoint` (base URL) and which environment
+/// variable supplies the key.
+pub struct OpenAiCompatibleTransport {
+    pub api_key: String,
+}
+
+impl ModelTransport for OpenAiCompatibleTransport {
+    fn generate(
+        &self,
+        endpoint: &str,
+        model: &str,
+        prompt: &str,
+        max_output_tokens: u32,
+        timeout_seconds: u64,
+    ) -> Result<Vec<u8>, PolicyViolation> {
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .timeout(Duration::from_secs(timeout_seconds))
+            .user_agent("viper-model-gateway/0.1")
+            .build()
+            .map_err(|e| violation("ERR_MODEL_FAILED", e.to_string()))?;
+        let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
+        let response = client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(&json!({
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_output_tokens,
+            }))
+            .send()
+            .map_err(|e| violation("ERR_MODEL_FAILED", e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(violation(
+                "ERR_MODEL_FAILED",
+                format!("model provider returned HTTP {}", response.status()),
+            ));
+        }
+        response
+            .bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| violation("ERR_MODEL_FAILED", e.to_string()))
+    }
+}
+
+pub struct AnthropicTransport {
+    pub api_key: String,
+}
+
+impl ModelTransport for AnthropicTransport {
+    fn generate(
+        &self,
+        endpoint: &str,
+        model: &str,
+        prompt: &str,
+        max_output_tokens: u32,
+        timeout_seconds: u64,
+    ) -> Result<Vec<u8>, PolicyViolation> {
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .timeout(Duration::from_secs(timeout_seconds))
+            .user_agent("viper-model-gateway/0.1")
+            .build()
+            .map_err(|e| violation("ERR_MODEL_FAILED", e.to_string()))?;
+        let url = format!("{}/v1/messages", endpoint.trim_end_matches('/'));
+        let response = client
+            .post(url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": model,
+                "max_tokens": max_output_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            }))
+            .send()
+            .map_err(|e| violation("ERR_MODEL_FAILED", e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(violation(
+                "ERR_MODEL_FAILED",
+                format!("model provider returned HTTP {}", response.status()),
+            ));
+        }
+        response
+            .bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| violation("ERR_MODEL_FAILED", e.to_string()))
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct EmbedResponse {
     pub gateway: &'static str,
@@ -133,6 +226,36 @@ struct OllamaResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct OpenAiChatResponse {
+    #[serde(default)]
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiMessage {
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicMessagesResponse {
+    #[serde(default)]
+    content: Vec<AnthropicContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct OllamaEmbedResponse {
     #[serde(default)]
     embeddings: Vec<Vec<f32>>,
@@ -179,6 +302,78 @@ pub fn generate(
     validate_prompt(prompt, max_prompt_chars)?;
     let body = transport.generate(endpoint, model, prompt, max_output_tokens, timeout_seconds)?;
     parse_ollama_response(model, &body)
+}
+
+fn parse_openai_response(model: &str, body: &[u8]) -> Result<GenerateResponse, PolicyViolation> {
+    let parsed: OpenAiChatResponse = serde_json::from_slice(body)
+        .map_err(|e| violation("ERR_MODEL_RESPONSE_INVALID", e.to_string()))?;
+    let text = parsed
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|choice| choice.message.content)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| violation("ERR_MODEL_RESPONSE_INVALID", "no completion returned"))?;
+    Ok(GenerateResponse {
+        gateway: "openai-compatible-model-v0",
+        classification: "MODEL_OUTPUT",
+        model: model.to_owned(),
+        text,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_openai_compatible(
+    transport: &dyn ModelTransport,
+    endpoint: &str,
+    model: &str,
+    prompt: &str,
+    max_prompt_chars: usize,
+    max_output_tokens: u32,
+    timeout_seconds: u64,
+) -> Result<GenerateResponse, PolicyViolation> {
+    validate_prompt(prompt, max_prompt_chars)?;
+    let body = transport.generate(endpoint, model, prompt, max_output_tokens, timeout_seconds)?;
+    parse_openai_response(model, &body)
+}
+
+fn parse_anthropic_response(model: &str, body: &[u8]) -> Result<GenerateResponse, PolicyViolation> {
+    let parsed: AnthropicMessagesResponse = serde_json::from_slice(body)
+        .map_err(|e| violation("ERR_MODEL_RESPONSE_INVALID", e.to_string()))?;
+    let text = parsed
+        .content
+        .into_iter()
+        .filter(|block| block.block_type == "text")
+        .map(|block| block.text)
+        .collect::<Vec<_>>()
+        .join("");
+    if text.is_empty() {
+        return Err(violation(
+            "ERR_MODEL_RESPONSE_INVALID",
+            "no text content block returned",
+        ));
+    }
+    Ok(GenerateResponse {
+        gateway: "anthropic-model-v0",
+        classification: "MODEL_OUTPUT",
+        model: model.to_owned(),
+        text,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_anthropic(
+    transport: &dyn ModelTransport,
+    endpoint: &str,
+    model: &str,
+    prompt: &str,
+    max_prompt_chars: usize,
+    max_output_tokens: u32,
+    timeout_seconds: u64,
+) -> Result<GenerateResponse, PolicyViolation> {
+    validate_prompt(prompt, max_prompt_chars)?;
+    let body = transport.generate(endpoint, model, prompt, max_output_tokens, timeout_seconds)?;
+    parse_anthropic_response(model, &body)
 }
 
 fn validate_embed_input(input: &str, max_input_chars: usize) -> Result<(), PolicyViolation> {
@@ -311,6 +506,181 @@ mod tests {
         }));
         let error = generate(&transport, "http://x", "m", "hi", 1000, 128, 5).unwrap_err();
         assert_eq!(error.code, "ERR_MODEL_FAILED");
+    }
+
+    mod openai_compatible {
+        use super::super::{generate_openai_compatible, ModelTransport, PolicyViolation};
+
+        struct CannedTransport(Result<Vec<u8>, PolicyViolation>);
+
+        impl ModelTransport for CannedTransport {
+            fn generate(
+                &self,
+                _endpoint: &str,
+                _model: &str,
+                _prompt: &str,
+                _max_output_tokens: u32,
+                _timeout_seconds: u64,
+            ) -> Result<Vec<u8>, PolicyViolation> {
+                match &self.0 {
+                    Ok(body) => Ok(body.clone()),
+                    Err(e) => Err(e.clone()),
+                }
+            }
+        }
+
+        fn must_not_be_called() -> CannedTransport {
+            CannedTransport(Err(PolicyViolation {
+                code: "ERR_MODEL_FAILED",
+                message: "must not be called".into(),
+            }))
+        }
+
+        #[test]
+        fn rejects_empty_prompt_before_any_transport_call() {
+            let error =
+                generate_openai_compatible(&must_not_be_called(), "http://x", "m", "  ", 100, 128, 5)
+                    .unwrap_err();
+            assert_eq!(error.code, "ERR_MODEL_PROMPT_INVALID");
+        }
+
+        #[test]
+        fn maps_a_canned_successful_response_to_the_documented_shape() {
+            let body =
+                br#"{"choices":[{"message":{"role":"assistant","content":"hello world"}}]}"#
+                    .to_vec();
+            let transport = CannedTransport(Ok(body));
+            let response =
+                generate_openai_compatible(&transport, "http://x", "gpt-4o-mini", "hi", 1000, 128, 5)
+                    .expect("canned response parses");
+            assert_eq!(response.classification, "MODEL_OUTPUT");
+            assert_eq!(response.model, "gpt-4o-mini");
+            assert_eq!(response.text, "hello world");
+        }
+
+        #[test]
+        fn rejects_a_response_with_no_choices() {
+            let body = br#"{"choices":[]}"#.to_vec();
+            let transport = CannedTransport(Ok(body));
+            let error =
+                generate_openai_compatible(&transport, "http://x", "m", "hi", 1000, 128, 5)
+                    .unwrap_err();
+            assert_eq!(error.code, "ERR_MODEL_RESPONSE_INVALID");
+        }
+
+        #[test]
+        fn rejects_malformed_json_from_the_provider() {
+            let transport = CannedTransport(Ok(b"not json".to_vec()));
+            let error =
+                generate_openai_compatible(&transport, "http://x", "m", "hi", 1000, 128, 5)
+                    .unwrap_err();
+            assert_eq!(error.code, "ERR_MODEL_RESPONSE_INVALID");
+        }
+
+        #[test]
+        fn propagates_a_transport_failure_unchanged() {
+            let transport = CannedTransport(Err(PolicyViolation {
+                code: "ERR_MODEL_FAILED",
+                message: "invalid api key".into(),
+            }));
+            let error =
+                generate_openai_compatible(&transport, "http://x", "m", "hi", 1000, 128, 5)
+                    .unwrap_err();
+            assert_eq!(error.code, "ERR_MODEL_FAILED");
+        }
+    }
+
+    mod anthropic {
+        use super::super::{generate_anthropic, ModelTransport, PolicyViolation};
+
+        struct CannedTransport(Result<Vec<u8>, PolicyViolation>);
+
+        impl ModelTransport for CannedTransport {
+            fn generate(
+                &self,
+                _endpoint: &str,
+                _model: &str,
+                _prompt: &str,
+                _max_output_tokens: u32,
+                _timeout_seconds: u64,
+            ) -> Result<Vec<u8>, PolicyViolation> {
+                match &self.0 {
+                    Ok(body) => Ok(body.clone()),
+                    Err(e) => Err(e.clone()),
+                }
+            }
+        }
+
+        fn must_not_be_called() -> CannedTransport {
+            CannedTransport(Err(PolicyViolation {
+                code: "ERR_MODEL_FAILED",
+                message: "must not be called".into(),
+            }))
+        }
+
+        #[test]
+        fn rejects_empty_prompt_before_any_transport_call() {
+            let error = generate_anthropic(&must_not_be_called(), "http://x", "m", "  ", 100, 128, 5)
+                .unwrap_err();
+            assert_eq!(error.code, "ERR_MODEL_PROMPT_INVALID");
+        }
+
+        #[test]
+        fn maps_a_canned_successful_response_to_the_documented_shape() {
+            let body = br#"{"content":[{"type":"text","text":"hello world"}],"role":"assistant"}"#
+                .to_vec();
+            let transport = CannedTransport(Ok(body));
+            let response = generate_anthropic(
+                &transport,
+                "http://x",
+                "claude-sonnet-5",
+                "hi",
+                1000,
+                128,
+                5,
+            )
+            .expect("canned response parses");
+            assert_eq!(response.classification, "MODEL_OUTPUT");
+            assert_eq!(response.model, "claude-sonnet-5");
+            assert_eq!(response.text, "hello world");
+        }
+
+        #[test]
+        fn joins_multiple_text_blocks_and_skips_non_text_blocks() {
+            let body = br#"{"content":[{"type":"text","text":"a"},{"type":"tool_use","text":""},{"type":"text","text":"b"}]}"#.to_vec();
+            let transport = CannedTransport(Ok(body));
+            let response = generate_anthropic(&transport, "http://x", "m", "hi", 1000, 128, 5)
+                .expect("canned response parses");
+            assert_eq!(response.text, "ab");
+        }
+
+        #[test]
+        fn rejects_a_response_with_no_text_blocks() {
+            let body = br#"{"content":[]}"#.to_vec();
+            let transport = CannedTransport(Ok(body));
+            let error = generate_anthropic(&transport, "http://x", "m", "hi", 1000, 128, 5)
+                .unwrap_err();
+            assert_eq!(error.code, "ERR_MODEL_RESPONSE_INVALID");
+        }
+
+        #[test]
+        fn rejects_malformed_json_from_the_provider() {
+            let transport = CannedTransport(Ok(b"not json".to_vec()));
+            let error = generate_anthropic(&transport, "http://x", "m", "hi", 1000, 128, 5)
+                .unwrap_err();
+            assert_eq!(error.code, "ERR_MODEL_RESPONSE_INVALID");
+        }
+
+        #[test]
+        fn propagates_a_transport_failure_unchanged() {
+            let transport = CannedTransport(Err(PolicyViolation {
+                code: "ERR_MODEL_FAILED",
+                message: "invalid api key".into(),
+            }));
+            let error = generate_anthropic(&transport, "http://x", "m", "hi", 1000, 128, 5)
+                .unwrap_err();
+            assert_eq!(error.code, "ERR_MODEL_FAILED");
+        }
     }
 
     mod embed {

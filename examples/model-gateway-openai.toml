@@ -1,0 +1,10 @@
+schema = "viper-boxd.model-gateway.v0"
+gateway_id = "OPENAI_GPT_V1"
+provider = "openai"
+endpoint = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+max_requests = 30
+max_prompt_chars = 8000
+max_output_tokens = 256
+timeout_seconds = 30

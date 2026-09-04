@@ -43,22 +43,45 @@ nothing here changes that.
 
 ## Provider
 
-First and only implemented provider: a **local Ollama** instance
-(`http://127.0.0.1:11434` by default), matching the existing
-`VIPER_LOCAL_OLLAMA_V1` manifest reference. No API key, no external network
-call — the gateway process talks to a fixed, administrator-configured
-loopback endpoint. This is not the same trust boundary as a Box's FETCH: the
-research gateway's SSRF protections (`is_private_or_local`, domain
-allowlist) exist because a Box's FETCH target is attacker-influenceable; a
-model gateway's provider endpoint is fixed operator configuration, never
-caller-supplied, so a loopback target here is the intended, correct
-behavior, not a bypassed control.
+Four `MODEL_GENERATE` providers are implemented, selected by the config's
+`provider` field, one gateway process per provider (a Box picks which one
+via `gateway_refs`, same as the research gateway):
 
-OpenAI and Anthropic remain possible future providers behind the same
-`ModelTransport` seam, each requiring an operator-supplied API key read
-from a named environment variable at startup — the same opt-in,
+- **`ollama`** — a local Ollama instance (`http://127.0.0.1:11434` by
+  default), matching the existing `VIPER_LOCAL_OLLAMA_V1` manifest
+  reference. No API key, no external network call — the gateway process
+  talks to a fixed, administrator-configured loopback endpoint. This is not
+  the same trust boundary as a Box's FETCH: the research gateway's SSRF
+  protections (`is_private_or_local`, domain allowlist) exist because a
+  Box's FETCH target is attacker-influenceable; a model gateway's provider
+  endpoint is fixed operator configuration, never caller-supplied, so a
+  loopback target here is the intended, correct behavior, not a bypassed
+  control.
+- **`openai`** — `POST {endpoint}/chat/completions`, `Authorization: Bearer
+  <key>`, Chat Completions request/response shape.
+- **`anthropic`** — `POST {endpoint}/v1/messages`, `x-api-key: <key>` plus
+  `anthropic-version: 2023-06-01`, Messages API request/response shape. Text
+  is joined from every `content[]` block with `type == "text"`; non-text
+  blocks (e.g. tool use) are skipped rather than erroring, since a plain
+  `MODEL_GENERATE` call has no tool-use surface to trigger them.
+- **`openrouter`** — reuses the exact same `OpenAiCompatibleTransport` as
+  `openai`, since OpenRouter's API is a drop-in-compatible proxy over the
+  same Chat Completions shape; only `endpoint` (`https://openrouter.ai/api/v1`)
+  and the model naming convention (e.g. `openai/gpt-4o-mini`) differ.
+
+`openai`, `anthropic`, and `openrouter` each require `api_key_env`, read
+from that named environment variable at startup — the same opt-in,
 fail-closed-if-misconfigured pattern already used for the Brave Search
-provider (see `SEARCH_PROVIDER_PLAN.md`). Neither is implemented here.
+provider (see `SEARCH_PROVIDER_PLAN.md`). `ollama` needs no key;
+`api_key_env` is optional and simply unused when `provider = "ollama"`. The
+key is read once at gateway startup and held only in the gateway process's
+own memory; it is never written to a config file, logged, or returned to a
+caller.
+
+`EMBED` remains `ollama`-only for now: OpenAI and OpenRouter both offer a
+real embeddings endpoint and are natural next candidates behind the same
+`EmbedTransport` seam, but adding them was out of scope for this round.
+Anthropic has no public embeddings API at all.
 
 ## Configuration
 
@@ -106,11 +129,15 @@ or token limit — those are fixed by the gateway's config.
 ## Transport seam
 
 Mirrors `research_fetcher::HttpTransport` and `search_provider::SearchTransport`:
-a `ModelTransport` trait isolates the real HTTP call to Ollama's
-`/api/generate` endpoint from prompt validation and response parsing, and a
-parallel `EmbedTransport` trait does the same for `/api/embed`, so both are
-unit-tested with a canned transport, no live Ollama instance required for
-the test suite.
+a `ModelTransport` trait isolates the real HTTP call from prompt validation
+and response parsing, and a parallel `EmbedTransport` trait does the same
+for `/api/embed`, so both are unit-tested with a canned transport, no live
+provider instance required for the test suite. Every `ModelTransport`
+implementation (`OllamaTransport`, `OpenAiCompatibleTransport`,
+`AnthropicTransport`) returns raw response bytes; response parsing is a
+separate, provider-specific free function (`parse_ollama_response`,
+`parse_openai_response`, `parse_anthropic_response`), each independently
+unit-tested against canned bytes.
 
 ## New error codes
 
@@ -129,16 +156,19 @@ gateway's existing pattern for FETCH and SEARCH.
 
 ## Wiring into viper-helper
 
-`examples/gateway-registry.toml` gains an entry for this gateway's socket
-under the same reference name the manifests already use:
+`examples/gateway-registry.toml` gains one entry per provider's socket,
+since each provider runs as its own `viper-model-gateway` process:
 
 ```toml
 VIPER_LOCAL_OLLAMA_V1 = "/tmp/viper-model-gateway.sock"
+OPENAI_GPT_V1 = "/tmp/viper-model-gateway-openai.sock"
+ANTHROPIC_CLAUDE_V1 = "/tmp/viper-model-gateway-anthropic.sock"
+OPENROUTER_V1 = "/tmp/viper-model-gateway-openrouter.sock"
 ```
 
 A Box's profile can then request `network_mode = "GATEWAY_ONLY"` with
-`gateway_refs` including `VIPER_LOCAL_OLLAMA_V1`, exactly like the research
-gateway integration already wired into `viper-helper`.
+`gateway_refs` including one of these, exactly like the research gateway
+integration already wired into `viper-helper`.
 
 ## Acceptance tests before this is considered done
 
@@ -162,7 +192,11 @@ gateway integration already wired into `viper-helper`.
 ## Explicitly out of scope here
 
 - any streaming transport;
-- OpenAI, Anthropic, or any other keyed/paid provider;
+- Blackbox, or any other provider whose request/response contract has not
+  been confirmed against real documentation (no API shape is guessed here);
+- `EMBED` for `openai` or `openrouter` (both offer a real embeddings
+  endpoint and are natural next candidates behind `EmbedTransport`, but
+  adding them was out of scope for this round);
 - per-token or per-request cost budgeting (meaningful only for a paid
   provider);
 - wiring `viper-model-gateway` into a live Box spawn end-to-end (the

@@ -8,8 +8,12 @@ use std::{
 };
 use viper_boxd::{
     ipc::{ipc_error as error, respond as response, Request, Response, IPC_VERSION},
-    model_provider::{self, OllamaEmbedTransport, OllamaTransport},
+    model_provider::{
+        self, AnthropicTransport, OllamaEmbedTransport, OllamaTransport, OpenAiCompatibleTransport,
+    },
 };
+
+const SUPPORTED_PROVIDERS: &[&str] = &["ollama", "openai", "anthropic", "openrouter"];
 
 #[derive(Debug, Deserialize)]
 struct EmbedConfig {
@@ -24,6 +28,8 @@ struct GatewayConfig {
     provider: String,
     endpoint: String,
     model: String,
+    #[serde(default)]
+    api_key_env: Option<String>,
     max_requests: u32,
     max_prompt_chars: usize,
     max_output_tokens: u32,
@@ -39,7 +45,7 @@ impl GatewayConfig {
         if config.schema != "viper-boxd.model-gateway.v0" {
             return Err("unsupported gateway config schema".into());
         }
-        if config.provider != "ollama" {
+        if !SUPPORTED_PROVIDERS.contains(&config.provider.as_str()) {
             return Err(format!("unsupported model provider: {}", config.provider));
         }
         if config.gateway_id.is_empty()
@@ -52,6 +58,13 @@ impl GatewayConfig {
         {
             return Err("gateway config contains empty or zero policy values".into());
         }
+        let requires_key = config.provider != "ollama";
+        if requires_key && config.api_key_env.as_deref().unwrap_or("").is_empty() {
+            return Err(format!(
+                "provider {} requires api_key_env",
+                config.provider
+            ));
+        }
         if let Some(embed) = &config.embed {
             if embed.model.is_empty() || embed.max_input_chars == 0 {
                 return Err("embed config contains empty or zero policy values".into());
@@ -59,9 +72,31 @@ impl GatewayConfig {
         }
         Ok(config)
     }
+
+    /// Resolves the configured provider's API key from its named
+    /// environment variable. The key never lives in the config file, and a
+    /// keyed provider with an unset or empty key is a startup error rather
+    /// than a silently disabled feature. `ollama` needs no key.
+    fn resolved_api_key(&self) -> Result<Option<String>, String> {
+        let Some(env_var) = &self.api_key_env else {
+            return Ok(None);
+        };
+        let key = env::var(env_var).map_err(|_| {
+            format!("provider is configured but environment variable {env_var} is not set")
+        })?;
+        if key.is_empty() {
+            return Err(format!("environment variable {env_var} is set but empty"));
+        }
+        Ok(Some(key))
+    }
 }
 
-fn handle(request: Request, config: &GatewayConfig, remaining: &AtomicU32) -> Response {
+fn handle(
+    request: Request,
+    config: &GatewayConfig,
+    remaining: &AtomicU32,
+    api_key: Option<&str>,
+) -> Response {
     if request.version != IPC_VERSION {
         return response(
             request.request_id,
@@ -96,19 +131,49 @@ fn handle(request: Request, config: &GatewayConfig, remaining: &AtomicU32) -> Re
                     error("ERR_INVALID_REQUEST", "MODEL_GENERATE requires params.prompt")
                 })
                 .and_then(|prompt| {
-                    model_provider::generate(
-                        &OllamaTransport,
-                        &config.endpoint,
-                        &config.model,
-                        prompt,
-                        config.max_prompt_chars,
-                        config.max_output_tokens,
-                        config.timeout_seconds,
-                    )
-                    .map(|result| {
-                        serde_json::to_value(result).expect("generate result serializes")
-                    })
-                    .map_err(|v| error(v.code, v.message))
+                    let outcome = match config.provider.as_str() {
+                        "ollama" => model_provider::generate(
+                            &OllamaTransport,
+                            &config.endpoint,
+                            &config.model,
+                            prompt,
+                            config.max_prompt_chars,
+                            config.max_output_tokens,
+                            config.timeout_seconds,
+                        ),
+                        "openai" | "openrouter" => model_provider::generate_openai_compatible(
+                            &OpenAiCompatibleTransport {
+                                api_key: api_key
+                                    .expect("keyed provider validated at config load")
+                                    .to_owned(),
+                            },
+                            &config.endpoint,
+                            &config.model,
+                            prompt,
+                            config.max_prompt_chars,
+                            config.max_output_tokens,
+                            config.timeout_seconds,
+                        ),
+                        "anthropic" => model_provider::generate_anthropic(
+                            &AnthropicTransport {
+                                api_key: api_key
+                                    .expect("keyed provider validated at config load")
+                                    .to_owned(),
+                            },
+                            &config.endpoint,
+                            &config.model,
+                            prompt,
+                            config.max_prompt_chars,
+                            config.max_output_tokens,
+                            config.timeout_seconds,
+                        ),
+                        other => unreachable!("provider {other} validated at config load"),
+                    };
+                    outcome
+                        .map(|result| {
+                            serde_json::to_value(result).expect("generate result serializes")
+                        })
+                        .map_err(|v| error(v.code, v.message))
                 })
         }
         "EMBED" => {
@@ -164,11 +229,12 @@ fn serve(
     mut stream: UnixStream,
     config: &GatewayConfig,
     remaining: &AtomicU32,
+    api_key: Option<&str>,
 ) -> std::io::Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let reply = match serde_json::from_str::<Request>(&line) {
-        Ok(request) => handle(request, config, remaining),
+        Ok(request) => handle(request, config, remaining, api_key),
         Err(e) => response(
             "unknown".into(),
             Err(error("ERR_INVALID_REQUEST", e.to_string())),
@@ -187,6 +253,7 @@ fn main() -> std::io::Result<()> {
         .nth(2)
         .unwrap_or_else(|| "examples/model-gateway.toml".into());
     let config = GatewayConfig::load(&config_path).map_err(std::io::Error::other)?;
+    let api_key = config.resolved_api_key().map_err(std::io::Error::other)?;
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
     eprintln!(
@@ -195,7 +262,7 @@ fn main() -> std::io::Result<()> {
     );
     let remaining = AtomicU32::new(config.max_requests);
     for stream in listener.incoming().flatten() {
-        let _ = serve(stream, &config, &remaining);
+        let _ = serve(stream, &config, &remaining, api_key.as_deref());
     }
     Ok(())
 }
@@ -218,9 +285,64 @@ mod tests {
     #[test]
     fn rejects_unsupported_provider() {
         let path = "/tmp/viper-unsupported-model-gateway.toml";
-        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='openai'\nendpoint='http://127.0.0.1:11434'\nmodel='m'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n").unwrap();
+        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='blackbox'\nendpoint='http://127.0.0.1:11434'\nmodel='m'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n").unwrap();
         assert!(GatewayConfig::load(path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn keyed_provider_without_api_key_env_is_rejected() {
+        let path = "/tmp/viper-keyed-no-env-model-gateway.toml";
+        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='openai'\nendpoint='https://api.openai.com/v1'\nmodel='gpt-4o-mini'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n").unwrap();
+        assert!(GatewayConfig::load(path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn keyed_provider_with_api_key_env_loads() {
+        let path = "/tmp/viper-keyed-with-env-model-gateway.toml";
+        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='anthropic'\nendpoint='https://api.anthropic.com'\nmodel='claude-sonnet-5'\napi_key_env='VIPER_TEST_ANTHROPIC_KEY'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n").unwrap();
+        assert!(GatewayConfig::load(path).is_ok());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resolved_api_key_is_none_for_ollama() {
+        assert!(config().resolved_api_key().expect("resolves").is_none());
+    }
+
+    #[test]
+    fn resolved_api_key_fails_closed_without_the_env_var_set() {
+        let path = "/tmp/viper-resolve-key-unset-model-gateway.toml";
+        let env_var = "VIPER_TEST_MODEL_KEY_UNSET";
+        std::env::remove_var(env_var);
+        std::fs::write(
+            path,
+            format!("schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='openai'\nendpoint='https://api.openai.com/v1'\nmodel='gpt-4o-mini'\napi_key_env='{env_var}'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n"),
+        )
+        .unwrap();
+        let config = GatewayConfig::load(path).expect("valid config");
+        let _ = std::fs::remove_file(path);
+        assert!(config.resolved_api_key().is_err());
+    }
+
+    #[test]
+    fn resolved_api_key_reads_the_named_env_var() {
+        let path = "/tmp/viper-resolve-key-set-model-gateway.toml";
+        let env_var = "VIPER_TEST_MODEL_KEY_SET";
+        std::env::set_var(env_var, "test-key-value");
+        std::fs::write(
+            path,
+            format!("schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='openai'\nendpoint='https://api.openai.com/v1'\nmodel='gpt-4o-mini'\napi_key_env='{env_var}'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n"),
+        )
+        .unwrap();
+        let config = GatewayConfig::load(path).expect("valid config");
+        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            config.resolved_api_key().expect("resolves"),
+            Some("test-key-value".to_owned())
+        );
+        std::env::remove_var(env_var);
     }
 
     fn config() -> GatewayConfig {
@@ -230,6 +352,7 @@ mod tests {
             provider: "ollama".into(),
             endpoint: "http://127.0.0.1:11434".into(),
             model: "test-model".into(),
+            api_key_env: None,
             max_requests: 2,
             max_prompt_chars: 1000,
             max_output_tokens: 128,
@@ -260,14 +383,14 @@ mod tests {
     #[test]
     fn rejects_unknown_tool() {
         let budget = AtomicU32::new(2);
-        let response = handle(request("SHELL", json!({})), &config(), &budget);
+        let response = handle(request("SHELL", json!({})), &config(), &budget, None);
         assert_eq!(response.error.unwrap().code, "ERR_TOOL_NOT_ALLOWED");
     }
 
     #[test]
     fn rejects_missing_prompt() {
         let budget = AtomicU32::new(2);
-        let response = handle(request("MODEL_GENERATE", json!({})), &config(), &budget);
+        let response = handle(request("MODEL_GENERATE", json!({})), &config(), &budget, None);
         assert_eq!(response.error.unwrap().code, "ERR_INVALID_REQUEST");
     }
 
@@ -278,6 +401,7 @@ mod tests {
             request("MODEL_GENERATE", json!({})),
             &config(),
             &budget,
+            None,
         );
         assert!(!first.ok);
         assert_eq!(budget.load(std::sync::atomic::Ordering::Acquire), 0);
@@ -285,6 +409,7 @@ mod tests {
             request("MODEL_GENERATE", json!({"prompt": "hi"})),
             &config(),
             &budget,
+            None,
         );
         assert_eq!(second.error.unwrap().code, "ERR_REQUEST_LIMIT_EXCEEDED");
     }
@@ -296,6 +421,7 @@ mod tests {
             request("EMBED", json!({"input": "hi"})),
             &config(),
             &budget,
+            None,
         );
         assert_eq!(response.error.unwrap().code, "ERR_NOT_IMPLEMENTED");
     }
@@ -303,17 +429,32 @@ mod tests {
     #[test]
     fn configured_embed_still_validates_input_before_any_transport_call() {
         let budget = AtomicU32::new(2);
-        let response = handle(request("EMBED", json!({})), &config_with_embed(), &budget);
+        let response = handle(
+            request("EMBED", json!({})),
+            &config_with_embed(),
+            &budget,
+            None,
+        );
         assert_eq!(response.error.unwrap().code, "ERR_INVALID_REQUEST");
     }
 
     #[test]
     fn embed_also_consumes_the_shared_request_budget() {
         let budget = AtomicU32::new(1);
-        let first = handle(request("EMBED", json!({"input": "hi"})), &config(), &budget);
+        let first = handle(
+            request("EMBED", json!({"input": "hi"})),
+            &config(),
+            &budget,
+            None,
+        );
         assert!(!first.ok);
         assert_eq!(budget.load(std::sync::atomic::Ordering::Acquire), 0);
-        let second = handle(request("EMBED", json!({"input": "hi"})), &config(), &budget);
+        let second = handle(
+            request("EMBED", json!({"input": "hi"})),
+            &config(),
+            &budget,
+            None,
+        );
         assert_eq!(second.error.unwrap().code, "ERR_REQUEST_LIMIT_EXCEEDED");
     }
 
@@ -323,7 +464,7 @@ mod tests {
         r.version = "0.9".into();
         let budget = AtomicU32::new(2);
         assert_eq!(
-            handle(r, &config(), &budget).error.unwrap().code,
+            handle(r, &config(), &budget, None).error.unwrap().code,
             "ERR_UNSUPPORTED_SCHEMA"
         );
     }
