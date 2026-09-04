@@ -168,6 +168,29 @@ network-deny probe. A `spawn` request may request the same wiring for a real
 Box lifecycle with `"network_mode": "GATEWAY_ONLY", "gateway_refs": [...]`;
 an unknown or unreachable reference fails closed with `ERR_NETWORK_SETUP`.
 
+Add `--call MODEL_GENERATE` to prove a real functional round trip, not just
+reachability — a fixed, built-in prompt, never a caller-supplied one:
+
+```bash
+cargo run --bin viper-model-gateway -- /tmp/viper-model-gateway.sock \
+  examples/model-gateway.toml
+cargo run --bin viper-boxd -- gateway-probe --socket /tmp/viper-helper.sock \
+  --gateway-ref VIPER_LOCAL_OLLAMA_V1 --call MODEL_GENERATE
+```
+
+This is the full loop closed end to end: a Box spawned with
+`network_mode: GATEWAY_ONLY` and `gateway_refs: [VIPER_LOCAL_OLLAMA_V1]`
+reaches only its bind-mounted gateway socket, calls a real `MODEL_GENERATE`
+through it, and gets back a real answer from Ollama — while direct network
+access stays fully denied. Verified together on this host: `spawn` a Box
+under that exact policy (confirmed `status: active`), run the probe above
+against the same gateway while the Box is alive, then `kill`/`cleanup` it.
+`spawn`'s payload deliberately stays the fixed `/usr/bin/sleep` test
+executable per `BACKEND_CONTRACT.md` ("arbitrary shell commands are not
+supported"); the probe runs as a second unit under byte-identical isolation
+properties rather than adding a way to run arbitrary code inside a spawned
+Box.
+
 ### Mock gateway contract
 
 The gateway boundary is specified in [GATEWAY_CONTRACT.md](GATEWAY_CONTRACT.md)

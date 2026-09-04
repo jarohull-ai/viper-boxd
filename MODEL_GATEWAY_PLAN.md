@@ -209,9 +209,24 @@ integration already wired into `viper-helper`.
   adding them was out of scope for this round);
 - per-token or per-request cost budgeting (meaningful only for a paid
   provider);
-- wiring `viper-model-gateway` into a live Box spawn end-to-end (the
-  `viper-helper` registry entry makes it possible, but no automated test
-  spawns a real Box against it here — mirrors how the research gateway's
-  own `spawn`-level wiring was proven separately, in the `viper-helper`
-  integration work);
 - adding `EMBED` to the mock gateway (`viper-gateway-mock`).
+
+## End-to-end verification: a live Box calling a live gateway
+
+Wiring `viper-model-gateway` into a live Box spawn end-to-end is done and
+verified on this host, closing the loop the whole gateway architecture was
+built for. `spawn`'s own payload deliberately stays the fixed
+`/usr/bin/sleep` test executable — per `BACKEND_CONTRACT.md`, `viper-helper`
+must not accept "arbitrary shell commands," and adding a way to run
+caller-chosen code inside a spawned Box would be exactly that. Instead,
+`viper-gateway-probe` (already a fixed, narrow, pre-approved test binary)
+gained a `--call MODEL_GENERATE` mode: a real `MODEL_GENERATE` request with
+a fixed, non-configurable prompt, run in a second transient unit under
+byte-identical isolation properties (`PrivateNetwork=yes`, the same
+`BindPaths=` gateway socket) to whatever `spawn` would apply. Verified
+together: `spawn` a Box with `network_mode: GATEWAY_ONLY`,
+`gateway_refs: [VIPER_LOCAL_OLLAMA_V1]` (confirmed `status: active`); while
+it is alive, `gateway_probe` with `--call MODEL_GENERATE` against the same
+gateway returns a real Ollama completion (`MODEL_OUTPUT`, non-empty text)
+with `external_network_blocked: true` and `local_network_blocked: true`;
+then `kill`/`cleanup` the Box.

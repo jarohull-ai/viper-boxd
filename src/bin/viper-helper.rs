@@ -342,7 +342,14 @@ fn run_network_probe() -> Result<Value, IpcErrorBody> {
         .map_err(|e| error("ERR_PROBE_OUTPUT", e.to_string()))
 }
 
-fn run_gateway_probe(gateway_ref: &str, socket: &str) -> Result<Value, IpcErrorBody> {
+/// `call_method` selects one of the probe binary's fixed, built-in request
+/// kinds (`PING` or `MODEL_GENERATE`); it is never a caller-supplied
+/// arbitrary string passed through to the gateway.
+fn run_gateway_probe(
+    gateway_ref: &str,
+    socket: &str,
+    call_method: &str,
+) -> Result<Value, IpcErrorBody> {
     if !gateway_socket_is_live(socket) {
         return Err(error(
             "ERR_NETWORK_SETUP",
@@ -361,23 +368,26 @@ fn run_gateway_probe(gateway_ref: &str, socket: &str) -> Result<Value, IpcErrorB
         })?;
     let unit = format!("viper-boxd-gateway-probe-{}", std::process::id());
     let bind_path = format!("BindPaths={socket}:{socket}");
-    let output = Command::new("systemd-run")
-        .args([
-            "--user",
-            "--wait",
-            "--pipe",
-            &format!("--unit={unit}"),
-            "--property",
-            "PrivateNetwork=yes",
-            "--property",
-            "ProtectHome=read-only",
-            "--property",
-            "ProtectSystem=strict",
-            "--property",
-            &bind_path,
-        ])
-        .arg(&probe)
-        .args(["--socket", socket])
+    let mut command = Command::new("systemd-run");
+    command.args([
+        "--user",
+        "--wait",
+        "--pipe",
+        &format!("--unit={unit}"),
+        "--property",
+        "PrivateNetwork=yes",
+        "--property",
+        "ProtectHome=read-only",
+        "--property",
+        "ProtectSystem=strict",
+        "--property",
+        &bind_path,
+    ]);
+    command.arg(&probe).args(["--socket", socket]);
+    if call_method != "PING" {
+        command.args(["--call", call_method]);
+    }
+    let output = command
         .output()
         .map_err(|e| error("ERR_PROBE_EXECUTION", e.to_string()))?;
     if !output.status.success() {
@@ -551,24 +561,36 @@ fn handle(request: Request, states: &States, gateways: &GatewayRegistry) -> Resp
                 .get("gateway_ref")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            let call_method = request
+                .params
+                .get("call")
+                .and_then(Value::as_str)
+                .unwrap_or("PING");
             if gateway_ref.is_empty() {
                 Err(error("ERR_INVALID_REQUEST", "gateway_ref is required"))
+            } else if call_method != "PING" && call_method != "MODEL_GENERATE" {
+                Err(error(
+                    "ERR_INVALID_REQUEST",
+                    "call must be PING or MODEL_GENERATE",
+                ))
             } else {
                 match gateways.get(gateway_ref) {
                     None => Err(error(
                         "ERR_NETWORK_SETUP",
                         format!("unknown gateway reference: {gateway_ref}"),
                     )),
-                    Some(socket) => run_gateway_probe(gateway_ref, socket).map(|probe| {
-                        json!({
-                            "status": "PROBE_COMPLETED",
-                            "probe": probe,
-                            "gateway_ref": gateway_ref,
-                            "network_mode": "GATEWAY_ONLY",
-                            "private_network": true,
-                            "side_effects": true,
+                    Some(socket) => {
+                        run_gateway_probe(gateway_ref, socket, call_method).map(|probe| {
+                            json!({
+                                "status": "PROBE_COMPLETED",
+                                "probe": probe,
+                                "gateway_ref": gateway_ref,
+                                "network_mode": "GATEWAY_ONLY",
+                                "private_network": true,
+                                "side_effects": true,
+                            })
                         })
-                    }),
+                    }
                 }
             }
         }

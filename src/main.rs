@@ -33,7 +33,9 @@ fn usage() {
     eprintln!("  viper-boxd backend-self-test --socket PATH");
     eprintln!("  viper-boxd filesystem-probe --socket PATH");
     eprintln!("  viper-boxd network-probe --socket PATH");
-    eprintln!("  viper-boxd gateway-probe --socket PATH --gateway-ref REF");
+    eprintln!(
+        "  viper-boxd gateway-probe --socket PATH --gateway-ref REF [--call PING|MODEL_GENERATE]"
+    );
     eprintln!("  viper-boxd gateway-self-test --socket PATH");
 }
 
@@ -329,11 +331,12 @@ fn main() -> ExitCode {
             arg_value(&args[2..], "--socket").unwrap_or_else(|| "/tmp/viper-helper.sock".into());
         let gateway_ref = arg_value(&args[2..], "--gateway-ref")
             .unwrap_or_else(|| "RESEARCH_PUBLIC_WEB_V1".into());
+        let call = arg_value(&args[2..], "--call").unwrap_or_else(|| "PING".into());
         let request = Request {
             version: IPC_VERSION.into(),
             request_id: format!("gateway-probe-{}", std::process::id()),
             method: "gateway_probe".into(),
-            params: json!({"gateway_ref": gateway_ref}),
+            params: json!({"gateway_ref": gateway_ref, "call": call}),
         };
         match send_request(&socket, &request) {
             Ok(response) => {
