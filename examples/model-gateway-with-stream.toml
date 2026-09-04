@@ -1,0 +1,16 @@
+schema = "viper-boxd.model-gateway.v0"
+gateway_id = "VIPER_LOCAL_OLLAMA_V1"
+provider = "ollama"
+endpoint = "http://127.0.0.1:11434"
+model = "mistral:7b"
+max_requests = 30
+max_prompt_chars = 8000
+max_output_tokens = 256
+timeout_seconds = 30
+
+# Streaming is opt-in and ollama-only (STREAM_PLAN.md). Without this table
+# a MODEL_GENERATE call with params.stream: true returns ERR_NOT_IMPLEMENTED,
+# so the base examples/model-gateway.toml is unaffected.
+[stream]
+idle_timeout_seconds = 15
+max_stream_duration_seconds = 60

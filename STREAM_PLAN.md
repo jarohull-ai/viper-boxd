@@ -119,29 +119,78 @@ operator config, never caller-supplied:
 one unit of the shared budget, same as one non-streaming call, checked
 before the first chunk is requested from the provider — not once per chunk.
 
+### Implementation note: how the idle timeout is actually enforced
+
+`reqwest`'s blocking client has no per-read timeout on a streaming response
+body — its own `.timeout()` bounds the whole request. `OllamaStreamTransport`
+runs the blocking HTTP call and line-by-line body read on a background
+thread, sending each parsed line to the caller over an `mpsc::channel`; the
+foreground loop uses `recv_timeout(idle_timeout_seconds)`, which is the real
+idle-gap enforcement. The client's own `.timeout(max_stream_duration_seconds)`
+is the absolute backstop underneath that, bounding the background thread
+even if the foreground gives up early on an idle timeout. One accepted
+limitation: on an idle-timeout return, the background thread is not joined
+(a blocking `reqwest` request has no cancellation handle) — it keeps
+running, bounded by the client timeout, and its eventual send to the
+now-unreceived channel is silently dropped. This is a deliberate, documented
+tradeoff, not an oversight: actively cancelling an in-flight blocking HTTP
+request would need lower-level socket control this design doesn't add.
+
+## Verified end to end on this host
+
+Real token-by-token streaming against `mistral:7b`: 16 `StreamChunk` frames
+delivered over the wire in order, each with an incrementing `sequence`, the
+final frame `done: true` with an empty `delta`, concatenating to the full
+generated text. Confirmed the non-streaming path is provably unaffected
+(same request against the same running gateway, without `stream: true`,
+returns the ordinary single `Response`). Confirmed both documented failure
+paths live: a streaming call missing `params.prompt` returns one `done:
+true` chunk with `ERR_INVALID_REQUEST`; a streaming call against a gateway
+with no `[stream]` table returns one `done: true` chunk with
+`ERR_NOT_IMPLEMENTED`, both without ever contacting Ollama.
+
 ## Error codes
 
-No new codes. `ERR_MODEL_PROMPT_INVALID`, `ERR_MODEL_FAILED`, and
-`ERR_MODEL_RESPONSE_INVALID` are reused, carried in the final chunk's
-`error` field instead of a top-level `Response.error`.
+No new codes. Every code the final chunk's `error` field carries is one
+already established elsewhere in the contract: `ERR_UNSUPPORTED_SCHEMA`,
+`ERR_REQUEST_LIMIT_EXCEEDED`, `ERR_NOT_IMPLEMENTED`, `ERR_INVALID_REQUEST`
+(all shared with the non-streaming path's setup checks), plus
+`ERR_MODEL_PROMPT_INVALID`, `ERR_MODEL_FAILED`, and
+`ERR_MODEL_RESPONSE_INVALID` for failures during or after the transport
+call — carried in the final chunk's `error` field instead of a top-level
+`Response.error`.
 
 ## Acceptance tests before this is considered done
 
 - a non-streaming `MODEL_GENERATE` call is provably unaffected: same
-  request/response shape, same tests, same behavior, whether or not this
-  plan is implemented;
+  request/response shape, same tests, same behavior — **done**, verified
+  both by the unchanged non-streaming test suite and live, side by side
+  with a real streaming call against the same running gateway;
 - `send_streaming_request` against a canned sequence of chunks delivers
   them in order and stops exactly at `done: true`, with no live provider
-  or socket needed for that part;
+  or socket needed for that part — **done** (`ipc::tests`, using a real
+  local `UnixListener` serving canned frames);
 - a canned mid-stream failure surfaces as a single final chunk with `done:
-  true` and the expected `error.code`, not a hang or a silent drop;
-- the idle-chunk timeout and max-stream-duration caps are both exercised
-  and proven to terminate a stalled stream;
+  true` and the expected `error.code`, not a hang or a silent drop —
+  **done** (`ipc::tests` and `model_provider::tests::streaming`);
 - `max_requests` is consumed exactly once per streaming call, not once per
-  chunk;
-- `cargo test --locked`, Clippy, and `cargo audit` all pass;
+  chunk — **done**, by construction (checked once before the transport
+  call, same as every other method);
+- `cargo test --locked`, Clippy, and `cargo audit` all pass — **done**;
 - verified against a real local Ollama instance on this host with
-  `"stream": true`, not only canned chunks.
+  `"stream": true`, not only canned chunks — **done**: real token-by-token
+  deltas, both live failure paths (missing prompt, streaming not
+  configured), and a live non-streaming regression check, all above;
+- the idle-chunk timeout and max-stream-duration caps are both exercised
+  and proven to terminate a stalled stream — **done**
+  (`tests/model_stream_timeout.rs`, against deliberately slow/stuck raw TCP
+  servers, since a live Ollama call responds too quickly to exercise this):
+  a server that never sends a first chunk trips the idle timeout near 1s
+  instead of waiting out a 5s hold; a server that stalls after one chunk
+  trips it the same way, having already delivered that one delta; a server
+  that stays alive but silent is still cut off by `max_stream_duration`
+  even with a much longer idle timeout configured, confirming that cap is
+  a real backstop and not merely config-validated.
 
 ## Explicitly out of scope here
 

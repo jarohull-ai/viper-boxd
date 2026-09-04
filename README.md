@@ -284,12 +284,28 @@ cargo run --bin viper-model-gateway -- /tmp/viper-model-gateway.sock \
   examples/model-gateway-with-embed.toml
 ```
 
-Token-by-token streaming is planned but not implemented: the current IPC
-contract is one request to exactly one response per line, which real
-streaming output needs to change. The design — `stream: true` as a flag on
-`MODEL_GENERATE` rather than a new method, the new frame format, and why
-Ollama is staged before the SSE-based providers — is documented in
-[STREAM_PLAN.md](STREAM_PLAN.md).
+Token-by-token streaming is implemented for `ollama`: `stream: true` as a
+flag on `MODEL_GENERATE` (not a new method — every real provider models it
+this way), a new `StreamChunk` frame sequence over the same JSON-lines Unix
+socket, and an idle-chunk timeout plus an absolute max-stream-duration cap a
+one-shot request never needed. `Response` and `send_request` are untouched;
+every non-streaming caller keeps working exactly as before. Full design,
+the SSE-based providers explicitly staged for later, and live verification
+results are documented in [STREAM_PLAN.md](STREAM_PLAN.md).
+
+```bash
+ollama pull mistral:7b
+cargo run --bin viper-model-gateway -- /tmp/viper-model-gateway.sock \
+  examples/model-gateway-with-stream.toml
+```
+
+A client sends `MODEL_GENERATE` with `"params": {"prompt": "...", "stream":
+true}` and reads `StreamChunk` frames off the same connection until one
+arrives with `done: true` (`ipc::send_streaming_request` does this).
+Without a `[stream]` table (the base `examples/model-gateway.toml`) a
+streaming request still gets back one `done: true` chunk, carrying
+`ERR_NOT_IMPLEMENTED` — the wire contract stays symmetric even for an
+immediate failure.
 
 ## Backend decision
 

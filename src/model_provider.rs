@@ -68,6 +68,159 @@ impl ModelTransport for OllamaTransport {
     }
 }
 
+/// One line of Ollama's own streaming `/api/generate` response body, which
+/// is itself newline-delimited JSON — symmetric with our own wire format,
+/// per STREAM_PLAN.md.
+#[derive(Debug, Deserialize)]
+struct OllamaStreamLine {
+    #[serde(default)]
+    response: String,
+    #[serde(default)]
+    done: bool,
+}
+
+/// Isolates the real streaming HTTP call from prompt validation and chunk
+/// sequencing, mirroring `ModelTransport`. `on_delta` is called once per
+/// line the provider sends; the last call always has `done: true` and
+/// happens only on success — a mid-stream failure is reported through the
+/// `Result`, never through a synthetic final `on_delta` call.
+pub trait ModelStreamTransport {
+    #[allow(clippy::too_many_arguments)]
+    fn generate_stream(
+        &self,
+        endpoint: &str,
+        model: &str,
+        prompt: &str,
+        max_output_tokens: u32,
+        idle_timeout_seconds: u64,
+        max_stream_duration_seconds: u64,
+        on_delta: &mut dyn FnMut(&str, bool),
+    ) -> Result<(), PolicyViolation>;
+}
+
+pub struct OllamaStreamTransport;
+
+impl ModelStreamTransport for OllamaStreamTransport {
+    fn generate_stream(
+        &self,
+        endpoint: &str,
+        model: &str,
+        prompt: &str,
+        max_output_tokens: u32,
+        idle_timeout_seconds: u64,
+        max_stream_duration_seconds: u64,
+        on_delta: &mut dyn FnMut(&str, bool),
+    ) -> Result<(), PolicyViolation> {
+        // The blocking HTTP call runs on a background thread so the idle
+        // gap between chunks can be enforced with a plain recv_timeout,
+        // rather than needing per-read socket timeout plumbing through
+        // reqwest's blocking body reader. reqwest's own client-level
+        // timeout is the absolute cap: it bounds the background thread
+        // even if this function returns early on an idle timeout, so an
+        // abandoned request cannot run unbounded, though it is not
+        // actively joined in that case (a reqwest blocking Client has no
+        // request-cancellation handle to join it early).
+        let endpoint = endpoint.to_owned();
+        let model_owned = model.to_owned();
+        let prompt = prompt.to_owned();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<OllamaStreamLine, String>>();
+
+        std::thread::spawn(move || {
+            let outcome = (|| -> Result<(), String> {
+                let client = Client::builder()
+                    .redirect(Policy::none())
+                    .no_proxy()
+                    .timeout(Duration::from_secs(max_stream_duration_seconds))
+                    .user_agent("viper-model-gateway/0.1")
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                let url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
+                let response = client
+                    .post(url)
+                    .json(&json!({
+                        "model": model_owned,
+                        "prompt": prompt,
+                        "stream": true,
+                        "options": {"num_predict": max_output_tokens},
+                    }))
+                    .send()
+                    .map_err(|e| e.to_string())?;
+                if !response.status().is_success() {
+                    return Err(format!("model provider returned HTTP {}", response.status()));
+                }
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(response).lines() {
+                    let line = line.map_err(|e| e.to_string())?;
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let parsed: OllamaStreamLine =
+                        serde_json::from_str(&line).map_err(|e| e.to_string())?;
+                    let done = parsed.done;
+                    if tx.send(Ok(parsed)).is_err() {
+                        return Ok(()); // receiver gave up (idle timeout); stop reading
+                    }
+                    if done {
+                        return Ok(());
+                    }
+                }
+                Err("stream ended before a done line".into())
+            })();
+            if let Err(message) = outcome {
+                let _ = tx.send(Err(message));
+            }
+        });
+
+        loop {
+            match rx.recv_timeout(Duration::from_secs(idle_timeout_seconds)) {
+                Ok(Ok(line)) => {
+                    on_delta(&line.response, line.done);
+                    if line.done {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(message)) => return Err(violation("ERR_MODEL_FAILED", message)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(violation(
+                        "ERR_MODEL_FAILED",
+                        format!("no chunk received within {idle_timeout_seconds}s (idle timeout)"),
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(violation(
+                        "ERR_MODEL_RESPONSE_INVALID",
+                        "stream ended unexpectedly",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_stream(
+    transport: &dyn ModelStreamTransport,
+    endpoint: &str,
+    model: &str,
+    prompt: &str,
+    max_prompt_chars: usize,
+    max_output_tokens: u32,
+    idle_timeout_seconds: u64,
+    max_stream_duration_seconds: u64,
+    on_delta: &mut dyn FnMut(&str, bool),
+) -> Result<(), PolicyViolation> {
+    validate_prompt(prompt, max_prompt_chars)?;
+    transport.generate_stream(
+        endpoint,
+        model,
+        prompt,
+        max_output_tokens,
+        idle_timeout_seconds,
+        max_stream_duration_seconds,
+        on_delta,
+    )
+}
+
 /// Shared by the `openai` and `openrouter` providers: OpenRouter's API is a
 /// drop-in-compatible proxy over the same Chat Completions request/response
 /// shape, differing only in `endpoint` (base URL) and which environment
@@ -506,6 +659,111 @@ mod tests {
         }));
         let error = generate(&transport, "http://x", "m", "hi", 1000, 128, 5).unwrap_err();
         assert_eq!(error.code, "ERR_MODEL_FAILED");
+    }
+
+    mod streaming {
+        use super::super::{generate_stream, ModelStreamTransport, PolicyViolation};
+        use std::sync::Mutex;
+
+        struct CannedStreamTransport {
+            lines: Mutex<Vec<(String, bool)>>,
+            fail: Option<PolicyViolation>,
+        }
+
+        impl ModelStreamTransport for CannedStreamTransport {
+            fn generate_stream(
+                &self,
+                _endpoint: &str,
+                _model: &str,
+                _prompt: &str,
+                _max_output_tokens: u32,
+                _idle_timeout_seconds: u64,
+                _max_stream_duration_seconds: u64,
+                on_delta: &mut dyn FnMut(&str, bool),
+            ) -> Result<(), PolicyViolation> {
+                for (delta, done) in self.lines.lock().unwrap().iter() {
+                    on_delta(delta, *done);
+                }
+                match &self.fail {
+                    Some(violation) => Err(violation.clone()),
+                    None => Ok(()),
+                }
+            }
+        }
+
+        fn must_not_be_called() -> CannedStreamTransport {
+            CannedStreamTransport {
+                lines: Mutex::new(Vec::new()),
+                fail: Some(PolicyViolation {
+                    code: "ERR_MODEL_FAILED",
+                    message: "must not be called".into(),
+                }),
+            }
+        }
+
+        #[test]
+        fn rejects_empty_prompt_before_any_transport_call() {
+            let error =
+                generate_stream(&must_not_be_called(), "http://x", "m", "  ", 100, 128, 5, 30, &mut |_, _| {
+                    panic!("on_delta must not be called");
+                })
+                .unwrap_err();
+            assert_eq!(error.code, "ERR_MODEL_PROMPT_INVALID");
+        }
+
+        #[test]
+        fn delivers_deltas_in_order_and_succeeds_on_a_done_line() {
+            let transport = CannedStreamTransport {
+                lines: Mutex::new(vec![
+                    ("Hello".to_owned(), false),
+                    (" world".to_owned(), true),
+                ]),
+                fail: None,
+            };
+            let mut deltas = Vec::new();
+            generate_stream(
+                &transport,
+                "http://x",
+                "mistral:7b",
+                "hi",
+                1000,
+                128,
+                5,
+                30,
+                &mut |delta, done| deltas.push((delta.to_owned(), done)),
+            )
+            .expect("canned stream succeeds");
+            assert_eq!(
+                deltas,
+                vec![("Hello".to_owned(), false), (" world".to_owned(), true)]
+            );
+        }
+
+        #[test]
+        fn propagates_a_mid_stream_transport_failure() {
+            let transport = CannedStreamTransport {
+                lines: Mutex::new(vec![("partial".to_owned(), false)]),
+                fail: Some(PolicyViolation {
+                    code: "ERR_MODEL_FAILED",
+                    message: "connection reset".into(),
+                }),
+            };
+            let mut deltas = Vec::new();
+            let error = generate_stream(
+                &transport,
+                "http://x",
+                "m",
+                "hi",
+                1000,
+                128,
+                5,
+                30,
+                &mut |delta, done| deltas.push((delta.to_owned(), done)),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "ERR_MODEL_FAILED");
+            assert_eq!(deltas, vec![("partial".to_owned(), false)]);
+        }
     }
 
     mod openai_compatible {

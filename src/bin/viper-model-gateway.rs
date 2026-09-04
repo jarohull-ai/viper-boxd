@@ -7,9 +7,10 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 use viper_boxd::{
-    ipc::{ipc_error as error, respond as response, Request, Response, IPC_VERSION},
+    ipc::{ipc_error as error, respond as response, stream_chunk, Request, Response, IPC_VERSION},
     model_provider::{
-        self, AnthropicTransport, OllamaEmbedTransport, OllamaTransport, OpenAiCompatibleTransport,
+        self, AnthropicTransport, OllamaEmbedTransport, OllamaStreamTransport, OllamaTransport,
+        OpenAiCompatibleTransport,
     },
 };
 
@@ -19,6 +20,15 @@ const SUPPORTED_PROVIDERS: &[&str] = &["ollama", "openai", "anthropic", "openrou
 struct EmbedConfig {
     model: String,
     max_input_chars: usize,
+}
+
+/// Opt-in, `ollama`-only (STREAM_PLAN.md). Its absence keeps
+/// `params.stream: true` returning `ERR_NOT_IMPLEMENTED`, same pattern as
+/// `[embed]`.
+#[derive(Debug, Deserialize)]
+struct StreamConfig {
+    idle_timeout_seconds: u64,
+    max_stream_duration_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +46,8 @@ struct GatewayConfig {
     timeout_seconds: u64,
     #[serde(default)]
     embed: Option<EmbedConfig>,
+    #[serde(default)]
+    stream: Option<StreamConfig>,
 }
 
 impl GatewayConfig {
@@ -68,6 +80,20 @@ impl GatewayConfig {
         if let Some(embed) = &config.embed {
             if embed.model.is_empty() || embed.max_input_chars == 0 {
                 return Err("embed config contains empty or zero policy values".into());
+            }
+        }
+        if let Some(stream) = &config.stream {
+            if config.provider != "ollama" {
+                return Err("streaming is only implemented for provider ollama".into());
+            }
+            if stream.idle_timeout_seconds == 0 || stream.max_stream_duration_seconds == 0 {
+                return Err("stream config contains empty or zero policy values".into());
+            }
+            if stream.idle_timeout_seconds > stream.max_stream_duration_seconds {
+                return Err(
+                    "stream idle_timeout_seconds must not exceed max_stream_duration_seconds"
+                        .into(),
+                );
             }
         }
         Ok(config)
@@ -225,6 +251,118 @@ fn handle(
     response(id, result)
 }
 
+fn write_stream_chunk(
+    stream: &mut UnixStream,
+    chunk: &viper_boxd::ipc::StreamChunk,
+) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *stream, chunk).map_err(std::io::Error::other)?;
+    stream.write_all(b"\n")?;
+    stream.flush()
+}
+
+/// Handles one `MODEL_GENERATE` request with `params.stream: true`: writes a
+/// sequence of `StreamChunk` frames instead of the single `Response` the
+/// non-streaming path in `handle` writes. See STREAM_PLAN.md.
+fn serve_stream(
+    mut stream: UnixStream,
+    request: Request,
+    config: &GatewayConfig,
+    remaining: &AtomicU32,
+) -> std::io::Result<()> {
+    let request_id = request.request_id;
+
+    if request.version != IPC_VERSION {
+        let chunk = stream_chunk(
+            request_id,
+            0,
+            String::new(),
+            true,
+            Some(error("ERR_UNSUPPORTED_SCHEMA", "unsupported gateway version")),
+        );
+        return write_stream_chunk(&mut stream, &chunk);
+    }
+
+    if remaining
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_sub(1)
+        })
+        .is_err()
+    {
+        let chunk = stream_chunk(
+            request_id,
+            0,
+            String::new(),
+            true,
+            Some(error(
+                "ERR_REQUEST_LIMIT_EXCEEDED",
+                "model request budget exhausted",
+            )),
+        );
+        return write_stream_chunk(&mut stream, &chunk);
+    }
+
+    let Some(stream_config) = &config.stream else {
+        let chunk = stream_chunk(
+            request_id,
+            0,
+            String::new(),
+            true,
+            Some(error("ERR_NOT_IMPLEMENTED", "streaming is not configured")),
+        );
+        return write_stream_chunk(&mut stream, &chunk);
+    };
+
+    let prompt = match request.params.get("prompt").and_then(Value::as_str) {
+        Some(prompt) => prompt.to_owned(),
+        None => {
+            let chunk = stream_chunk(
+                request_id,
+                0,
+                String::new(),
+                true,
+                Some(error(
+                    "ERR_INVALID_REQUEST",
+                    "MODEL_GENERATE requires params.prompt",
+                )),
+            );
+            return write_stream_chunk(&mut stream, &chunk);
+        }
+    };
+
+    let mut sequence: u64 = 0;
+    let mut io_result: std::io::Result<()> = Ok(());
+    let outcome = model_provider::generate_stream(
+        &OllamaStreamTransport,
+        &config.endpoint,
+        &config.model,
+        &prompt,
+        config.max_prompt_chars,
+        config.max_output_tokens,
+        stream_config.idle_timeout_seconds,
+        stream_config.max_stream_duration_seconds,
+        &mut |delta, done| {
+            let chunk = stream_chunk(request_id.clone(), sequence, delta.to_owned(), done, None);
+            sequence += 1;
+            if let Err(e) = write_stream_chunk(&mut stream, &chunk) {
+                io_result = Err(e);
+            }
+        },
+    );
+    io_result?;
+
+    if let Err(violation) = outcome {
+        let chunk = stream_chunk(
+            request_id,
+            sequence,
+            String::new(),
+            true,
+            Some(error(violation.code, violation.message)),
+        );
+        write_stream_chunk(&mut stream, &chunk)?;
+    }
+    Ok(())
+}
+
 fn serve(
     mut stream: UnixStream,
     config: &GatewayConfig,
@@ -233,13 +371,26 @@ fn serve(
 ) -> std::io::Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-    let reply = match serde_json::from_str::<Request>(&line) {
-        Ok(request) => handle(request, config, remaining, api_key),
-        Err(e) => response(
-            "unknown".into(),
-            Err(error("ERR_INVALID_REQUEST", e.to_string())),
-        ),
+    let request: Request = match serde_json::from_str(&line) {
+        Ok(request) => request,
+        Err(e) => {
+            let reply = response(
+                "unknown".into(),
+                Err(error("ERR_INVALID_REQUEST", e.to_string())),
+            );
+            serde_json::to_writer(&mut stream, &reply).map_err(std::io::Error::other)?;
+            stream.write_all(b"\n")?;
+            return stream.flush();
+        }
     };
+
+    let is_streaming = request.method == "MODEL_GENERATE"
+        && request.params.get("stream").and_then(Value::as_bool) == Some(true);
+    if is_streaming {
+        return serve_stream(stream, request, config, remaining);
+    }
+
+    let reply = handle(request, config, remaining, api_key);
     serde_json::to_writer(&mut stream, &reply).map_err(std::io::Error::other)?;
     stream.write_all(b"\n")?;
     stream.flush()
@@ -358,6 +509,7 @@ mod tests {
             max_output_tokens: 128,
             timeout_seconds: 5,
             embed: None,
+            stream: None,
         }
     }
 
@@ -369,6 +521,61 @@ mod tests {
             }),
             ..config()
         }
+    }
+
+    fn base_toml() -> String {
+        "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='ollama'\nendpoint='http://127.0.0.1:11434'\nmodel='m'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n".to_owned()
+    }
+
+    fn load_with(name: &str, extra_toml: &str) -> Result<GatewayConfig, String> {
+        let path = format!("/tmp/viper-stream-config-test-{name}.toml");
+        std::fs::write(&path, format!("{}{extra_toml}", base_toml())).unwrap();
+        let result = GatewayConfig::load(&path);
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn stream_table_loads_for_ollama() {
+        let config = load_with(
+            "ok",
+            "[stream]\nidle_timeout_seconds=5\nmax_stream_duration_seconds=30\n",
+        )
+        .expect("valid stream config loads");
+        let stream = config.stream.expect("stream config present");
+        assert_eq!(stream.idle_timeout_seconds, 5);
+        assert_eq!(stream.max_stream_duration_seconds, 30);
+    }
+
+    #[test]
+    fn stream_table_rejected_for_a_non_ollama_provider() {
+        let path = "/tmp/viper-stream-non-ollama.toml";
+        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='openai'\nendpoint='https://api.openai.com/v1'\nmodel='m'\napi_key_env='X'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n[stream]\nidle_timeout_seconds=5\nmax_stream_duration_seconds=30\n").unwrap();
+        assert!(GatewayConfig::load(path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stream_table_rejects_zero_timeouts() {
+        assert!(load_with(
+            "zero-idle",
+            "[stream]\nidle_timeout_seconds=0\nmax_stream_duration_seconds=30\n"
+        )
+        .is_err());
+        assert!(load_with(
+            "zero-max",
+            "[stream]\nidle_timeout_seconds=5\nmax_stream_duration_seconds=0\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stream_table_rejects_idle_timeout_exceeding_max_duration() {
+        assert!(load_with(
+            "idle-too-big",
+            "[stream]\nidle_timeout_seconds=60\nmax_stream_duration_seconds=30\n"
+        )
+        .is_err());
     }
 
     fn request(method: &str, params: serde_json::Value) -> Request {
