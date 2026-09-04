@@ -1,0 +1,20 @@
+schema = "viper-boxd.model-gateway.v0"
+gateway_id = "VIPER_LOCAL_OLLAMA_V1"
+provider = "ollama"
+endpoint = "http://127.0.0.1:11434"
+model = "mistral:7b"
+max_requests = 30
+max_prompt_chars = 8000
+max_output_tokens = 256
+timeout_seconds = 30
+
+# EMBED is opt-in, same pattern as [search] in the research gateway. Without
+# this table the gateway returns ERR_NOT_IMPLEMENTED for EMBED, so the base
+# examples/model-gateway.toml is unaffected. Embedding-capable models are
+# typically distinct from generation models (e.g. `ollama pull
+# nomic-embed-text`); using a chat/completion model here will fail per-call
+# with ERR_EMBED_FAILED, not at gateway startup, since Ollama only rejects an
+# embed request once it inspects the named model's declared capabilities.
+[embed]
+model = "nomic-embed-text"
+max_input_chars = 8000

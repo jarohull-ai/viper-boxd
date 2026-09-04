@@ -16,8 +16,15 @@ the research gateway.
 - `MODEL_GENERATE` — the method name already established by
   `GATEWAY_CONTRACT.md` and the mock gateway's `MODEL_GENERATE` handler.
   Implemented by this plan.
-- `EMBED` (vectors) — a real, useful second method, but not implemented
-  here. Documented as a future method behind the same provider seam.
+- `EMBED` (vectors) — implemented, opt-in via an `[embed]` config table
+  (same opt-in pattern as `[search]` for the research gateway), behind a
+  separate `EmbedTransport` seam mirroring `ModelTransport`. Requires an
+  embedding-capable model distinct from the generation model — Ollama gates
+  this by the model's declared `embedding` capability, not by a server
+  flag; `mistral:7b` fails with `ERR_EMBED_FAILED`, `nomic-embed-text`
+  works (verified live, 768-dimension vectors). Not added to the mock
+  gateway (`viper-gateway-mock`), which still only serves `SEARCH`,
+  `FETCH`, and `MODEL_GENERATE`.
 - Streaming (token-by-token output) is explicitly **not** a method name.
   The current IPC contract is one JSON request to exactly one JSON response
   per line (`ipc::send_request` reads one line and returns); token
@@ -75,24 +82,35 @@ cost budget (`MODEL_COST_BUDGET_USD` in the manifest) is not enforced by
 this provider: local inference has no per-token billing. Cost enforcement
 is provider-specific and becomes relevant only for a future paid provider.
 
+`EMBED` is opt-in via an additional table (`examples/model-gateway-with-embed.toml`),
+absent by default so the base config's behavior is unchanged:
+
+```toml
+[embed]
+model = "nomic-embed-text"
+max_input_chars = 8000
+```
+
 ## Request/response contract
 
 No new caller-facing surface beyond what `GATEWAY_CONTRACT.md` already
-specifies: `MODEL_GENERATE` takes `params.prompt`. The caller cannot supply
-a model name, endpoint, provider, or token limit — those are fixed by the
-gateway's config.
+specifies: `MODEL_GENERATE` takes `params.prompt`, `EMBED` takes
+`params.input`. The caller cannot supply a model name, endpoint, provider,
+or token limit — those are fixed by the gateway's config.
 
 ```json
 {"gateway": "ollama-model-v0", "classification": "MODEL_OUTPUT", "model": "mistral:7b", "text": "..."}
+{"gateway": "ollama-model-v0", "classification": "MODEL_OUTPUT", "model": "nomic-embed-text", "embedding": [...], "dimensions": 768}
 ```
 
 ## Transport seam
 
 Mirrors `research_fetcher::HttpTransport` and `search_provider::SearchTransport`:
 a `ModelTransport` trait isolates the real HTTP call to Ollama's
-`/api/generate` endpoint from prompt validation and response parsing, so
-those are unit-tested with a canned transport, no live Ollama instance
-required for the test suite.
+`/api/generate` endpoint from prompt validation and response parsing, and a
+parallel `EmbedTransport` trait does the same for `/api/embed`, so both are
+unit-tested with a canned transport, no live Ollama instance required for
+the test suite.
 
 ## New error codes
 
@@ -101,6 +119,9 @@ required for the test suite.
 | `ERR_MODEL_PROMPT_INVALID` | `params.prompt` missing, empty, or exceeds `max_prompt_chars` |
 | `ERR_MODEL_FAILED` | Transport-level failure (connect/timeout/non-2xx from the provider) |
 | `ERR_MODEL_RESPONSE_INVALID` | Provider response was not the expected JSON shape |
+| `ERR_EMBED_INPUT_INVALID` | `params.input` missing, empty, or exceeds `max_input_chars` |
+| `ERR_EMBED_FAILED` | Transport-level failure, including a model with no embedding capability |
+| `ERR_EMBED_RESPONSE_INVALID` | Provider response was not the expected JSON shape, or returned no vector |
 
 `ERR_REQUEST_LIMIT_EXCEEDED` is reused for the shared `max_requests`
 budget, checked before any call to the provider, matching the research
@@ -121,19 +142,26 @@ gateway integration already wired into `viper-helper`.
 
 ## Acceptance tests before this is considered done
 
-- prompt validation rejects empty/oversized prompts without any network
-  call;
+- prompt/input validation rejects empty/oversized values without any
+  network call, for both `MODEL_GENERATE` and `EMBED`;
 - a canned successful Ollama response maps to the documented shape with
-  `MODEL_OUTPUT` and the configured model name;
-- a canned error/malformed response maps to a stable error code;
-- the request budget is consumed before the transport call;
+  `MODEL_OUTPUT` and the configured model name, for both methods;
+- a canned error/malformed response maps to a stable error code, for both
+  methods;
+- the request budget is consumed before the transport call, for both
+  methods;
+- `EMBED` with no `[embed]` table returns `ERR_NOT_IMPLEMENTED`, matching
+  the base `examples/model-gateway.toml`'s unchanged behavior;
 - `cargo test --locked`, Clippy, and `cargo audit` all pass;
 - verified against a real local Ollama instance on this host, not only
-  canned responses.
+  canned responses — done for both methods: `MODEL_GENERATE` against
+  `mistral:7b`, `EMBED` against `nomic-embed-text` (a model with no
+  declared `embedding` capability, e.g. `mistral:7b`, fails per-call with
+  `ERR_EMBED_FAILED` rather than at gateway startup).
 
 ## Explicitly out of scope here
 
-- `EMBED` and any streaming transport;
+- any streaming transport;
 - OpenAI, Anthropic, or any other keyed/paid provider;
 - per-token or per-request cost budgeting (meaningful only for a paid
   provider);
@@ -141,4 +169,5 @@ gateway integration already wired into `viper-helper`.
   `viper-helper` registry entry makes it possible, but no automated test
   spawns a real Box against it here — mirrors how the research gateway's
   own `spawn`-level wiring was proven separately, in the `viper-helper`
-  integration work).
+  integration work);
+- adding `EMBED` to the mock gateway (`viper-gateway-mock`).

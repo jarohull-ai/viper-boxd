@@ -9,7 +9,7 @@ mock implementation. It does not perform network requests or hold secrets.
 - Unix socket, one JSON request and one JSON response per line.
 - `version` must be `1.0`; unsupported versions fail closed.
 - Requests contain `request_id`, `method`, and `params`.
-- Supported methods are `SEARCH`, `FETCH`, and `MODEL_GENERATE`.
+- Supported methods are `SEARCH`, `FETCH`, `MODEL_GENERATE`, and `EMBED`.
 
 ## Request rules
 
@@ -41,15 +41,18 @@ callers, the same as `ERR_UNSUPPORTED_SCHEMA`.
 | Code | Raised by | Meaning |
 | --- | --- | --- |
 | `ERR_UNSUPPORTED_SCHEMA` | any gateway | `version` did not match `IPC_VERSION`. |
-| `ERR_INVALID_REQUEST` | any gateway | Request body was malformed or missing a required param (`url`, `query`, `prompt`). |
+| `ERR_INVALID_REQUEST` | any gateway | Request body was malformed or missing a required param (`url`, `query`, `prompt`, `input`). |
 | `ERR_TOOL_NOT_ALLOWED` | any gateway | `method` is not one this gateway serves. |
-| `ERR_NOT_IMPLEMENTED` | research gateway | Method is contractually valid but no provider is configured for it (`SEARCH` with no `[search]` table). |
+| `ERR_NOT_IMPLEMENTED` | research/model gateway | Method is contractually valid but no provider is configured for it (`SEARCH` with no `[search]` table, `EMBED` with no `[embed]` table). |
 | `ERR_SEARCH_QUERY_INVALID` | search provider | `params.query` was missing, empty, or unreasonably long. |
 | `ERR_SEARCH_FAILED` | search provider | The search provider request failed at the transport level (DNS, TLS, connect, timeout, non-2xx status). |
 | `ERR_SEARCH_RESPONSE_INVALID` | search provider | The search provider's response was not the expected JSON shape. |
 | `ERR_MODEL_PROMPT_INVALID` | model gateway | `params.prompt` was missing, empty, or exceeded the configured length. |
 | `ERR_MODEL_FAILED` | model gateway | The model provider request failed at the transport level. |
 | `ERR_MODEL_RESPONSE_INVALID` | model gateway | The model provider's response was not the expected JSON shape. |
+| `ERR_EMBED_INPUT_INVALID` | model gateway | `params.input` was missing, empty, or exceeded the configured length. |
+| `ERR_EMBED_FAILED` | model gateway | The embedding provider request failed at the transport level. |
+| `ERR_EMBED_RESPONSE_INVALID` | model gateway | The embedding provider's response was not the expected JSON shape, or returned no vector. |
 | `ERR_REQUEST_LIMIT_EXCEEDED` | research gateway | `max_requests` budget for the process is exhausted. |
 | `ERR_INVALID_URL` | research policy | `params.url` failed to parse as a URL. |
 | `ERR_URL_SCHEME_DENIED` | research policy | Scheme other than `https`. |

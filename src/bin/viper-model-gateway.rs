@@ -8,8 +8,14 @@ use std::{
 };
 use viper_boxd::{
     ipc::{ipc_error as error, respond as response, Request, Response, IPC_VERSION},
-    model_provider::{self, OllamaTransport},
+    model_provider::{self, OllamaEmbedTransport, OllamaTransport},
 };
+
+#[derive(Debug, Deserialize)]
+struct EmbedConfig {
+    model: String,
+    max_input_chars: usize,
+}
 
 #[derive(Debug, Deserialize)]
 struct GatewayConfig {
@@ -22,6 +28,8 @@ struct GatewayConfig {
     max_prompt_chars: usize,
     max_output_tokens: u32,
     timeout_seconds: u64,
+    #[serde(default)]
+    embed: Option<EmbedConfig>,
 }
 
 impl GatewayConfig {
@@ -43,6 +51,11 @@ impl GatewayConfig {
             || config.timeout_seconds == 0
         {
             return Err("gateway config contains empty or zero policy values".into());
+        }
+        if let Some(embed) = &config.embed {
+            if embed.model.is_empty() || embed.max_input_chars == 0 {
+                return Err("embed config contains empty or zero policy values".into());
+            }
         }
         Ok(config)
     }
@@ -98,9 +111,50 @@ fn handle(request: Request, config: &GatewayConfig, remaining: &AtomicU32) -> Re
                     .map_err(|v| error(v.code, v.message))
                 })
         }
+        "EMBED" => {
+            if remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_sub(1)
+                })
+                .is_err()
+            {
+                return response(
+                    id,
+                    Err(error(
+                        "ERR_REQUEST_LIMIT_EXCEEDED",
+                        "model request budget exhausted",
+                    )),
+                );
+            }
+            match &config.embed {
+                None => Err(error(
+                    "ERR_NOT_IMPLEMENTED",
+                    "EMBED provider is not configured",
+                )),
+                Some(embed_config) => request
+                    .params
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| error("ERR_INVALID_REQUEST", "EMBED requires params.input"))
+                    .and_then(|input| {
+                        model_provider::embed(
+                            &OllamaEmbedTransport,
+                            &config.endpoint,
+                            &embed_config.model,
+                            input,
+                            embed_config.max_input_chars,
+                            config.timeout_seconds,
+                        )
+                        .map(|result| {
+                            serde_json::to_value(result).expect("embed result serializes")
+                        })
+                        .map_err(|v| error(v.code, v.message))
+                    }),
+            }
+        }
         _ => Err(error(
             "ERR_TOOL_NOT_ALLOWED",
-            "only MODEL_GENERATE is enabled by this gateway",
+            "only MODEL_GENERATE and EMBED are enabled by this gateway",
         )),
     };
     response(id, result)
@@ -148,7 +202,7 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle, GatewayConfig};
+    use super::{handle, EmbedConfig, GatewayConfig};
     use serde_json::json;
     use std::sync::atomic::AtomicU32;
     use viper_boxd::ipc::{Request, IPC_VERSION};
@@ -180,6 +234,17 @@ mod tests {
             max_prompt_chars: 1000,
             max_output_tokens: 128,
             timeout_seconds: 5,
+            embed: None,
+        }
+    }
+
+    fn config_with_embed() -> GatewayConfig {
+        GatewayConfig {
+            embed: Some(EmbedConfig {
+                model: "nomic-embed-text".into(),
+                max_input_chars: 1000,
+            }),
+            ..config()
         }
     }
 
@@ -221,6 +286,34 @@ mod tests {
             &config(),
             &budget,
         );
+        assert_eq!(second.error.unwrap().code, "ERR_REQUEST_LIMIT_EXCEEDED");
+    }
+
+    #[test]
+    fn embed_without_config_returns_not_implemented() {
+        let budget = AtomicU32::new(2);
+        let response = handle(
+            request("EMBED", json!({"input": "hi"})),
+            &config(),
+            &budget,
+        );
+        assert_eq!(response.error.unwrap().code, "ERR_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn configured_embed_still_validates_input_before_any_transport_call() {
+        let budget = AtomicU32::new(2);
+        let response = handle(request("EMBED", json!({})), &config_with_embed(), &budget);
+        assert_eq!(response.error.unwrap().code, "ERR_INVALID_REQUEST");
+    }
+
+    #[test]
+    fn embed_also_consumes_the_shared_request_budget() {
+        let budget = AtomicU32::new(1);
+        let first = handle(request("EMBED", json!({"input": "hi"})), &config(), &budget);
+        assert!(!first.ok);
+        assert_eq!(budget.load(std::sync::atomic::Ordering::Acquire), 0);
+        let second = handle(request("EMBED", json!({"input": "hi"})), &config(), &budget);
         assert_eq!(second.error.unwrap().code, "ERR_REQUEST_LIMIT_EXCEEDED");
     }
 
