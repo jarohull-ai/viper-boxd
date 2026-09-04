@@ -202,8 +202,22 @@ cargo run --bin viper-research-gateway -- /tmp/viper-research-gateway.sock \
   examples/research-gateway.toml
 ```
 
-It currently exposes only policy-gated `FETCH`; `SEARCH` returns
-`ERR_NOT_IMPLEMENTED` until a provider and its audit policy are selected.
+`FETCH` is always policy-gated and live. `SEARCH` is opt-in: with no
+`[search]` table in the gateway config (the case above) it returns
+`ERR_NOT_IMPLEMENTED`, unchanged from before. Adding a `[search]` table
+enables the Brave Search API as a provider; the design, the DuckDuckGo
+evaluation that led to choosing Brave instead, and the new error codes are
+documented in [SEARCH_PROVIDER_PLAN.md](SEARCH_PROVIDER_PLAN.md):
+
+```bash
+export BRAVE_SEARCH_API_KEY="..."
+cargo run --bin viper-research-gateway -- /tmp/viper-research-gateway.sock \
+  examples/research-gateway-with-search.toml
+```
+
+The key is read from the environment at startup and never written to a
+config file or returned to a caller; a configured provider with an unset or
+empty key variable is a startup error, not a silently disabled feature.
 
 ## Backend decision
 

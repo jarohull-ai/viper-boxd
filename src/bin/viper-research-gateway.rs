@@ -10,7 +10,14 @@ use viper_boxd::{
     ipc::{ipc_error as error, respond as response, Request, Response, IPC_VERSION},
     research_fetcher,
     research_policy::ResearchPolicy,
+    search_provider::{self, BraveSearchTransport},
 };
+
+#[derive(Debug, Deserialize)]
+struct SearchConfig {
+    provider: String,
+    api_key_env: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct GatewayConfig {
@@ -21,6 +28,8 @@ struct GatewayConfig {
     max_fetch_bytes: usize,
     max_redirects: u8,
     timeout_seconds: u64,
+    #[serde(default)]
+    search: Option<SearchConfig>,
 }
 
 impl GatewayConfig {
@@ -52,9 +61,39 @@ impl GatewayConfig {
             timeout_seconds: self.timeout_seconds,
         }
     }
+    /// Resolves the configured search provider's API key from its named
+    /// environment variable. The key never lives in the config file itself,
+    /// and a configured-but-unresolvable provider is a startup error rather
+    /// than a silently disabled feature.
+    fn resolved_search_key(&self) -> Result<Option<String>, String> {
+        let Some(search) = &self.search else {
+            return Ok(None);
+        };
+        if search.provider != "brave" {
+            return Err(format!("unsupported search provider: {}", search.provider));
+        }
+        let key = env::var(&search.api_key_env).map_err(|_| {
+            format!(
+                "search is configured but environment variable {} is not set",
+                search.api_key_env
+            )
+        })?;
+        if key.is_empty() {
+            return Err(format!(
+                "environment variable {} is set but empty",
+                search.api_key_env
+            ));
+        }
+        Ok(Some(key))
+    }
 }
 
-fn handle(request: Request, policy: &ResearchPolicy, remaining: &AtomicU32) -> Response {
+fn handle(
+    request: Request,
+    policy: &ResearchPolicy,
+    remaining: &AtomicU32,
+    search_key: Option<&str>,
+) -> Response {
     if request.version != IPC_VERSION {
         return response(
             request.request_id,
@@ -94,10 +133,40 @@ fn handle(request: Request, policy: &ResearchPolicy, remaining: &AtomicU32) -> R
                         .map_err(|v| error(v.code, v.message))
                 })
         }
-        "SEARCH" => Err(error(
-            "ERR_NOT_IMPLEMENTED",
-            "SEARCH provider is not configured yet",
-        )),
+        "SEARCH" => {
+            if remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                    value.checked_sub(1)
+                })
+                .is_err()
+            {
+                return response(
+                    id,
+                    Err(error(
+                        "ERR_REQUEST_LIMIT_EXCEEDED",
+                        "research request budget exhausted",
+                    )),
+                );
+            }
+            match search_key {
+                None => Err(error(
+                    "ERR_NOT_IMPLEMENTED",
+                    "SEARCH provider is not configured",
+                )),
+                Some(api_key) => request
+                    .params
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| error("ERR_INVALID_REQUEST", "SEARCH requires params.query"))
+                    .and_then(|query| {
+                        search_provider::search(&BraveSearchTransport, api_key, query)
+                            .map(|result| {
+                                serde_json::to_value(result).expect("search result serializes")
+                            })
+                            .map_err(|v| error(v.code, v.message))
+                    }),
+            }
+        }
         _ => Err(error(
             "ERR_TOOL_NOT_ALLOWED",
             "only FETCH is enabled by this gateway",
@@ -110,11 +179,12 @@ fn serve(
     mut stream: UnixStream,
     policy: &ResearchPolicy,
     remaining: &AtomicU32,
+    search_key: Option<&str>,
 ) -> std::io::Result<()> {
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let reply = match serde_json::from_str::<Request>(&line) {
-        Ok(request) => handle(request, policy, remaining),
+        Ok(request) => handle(request, policy, remaining, search_key),
         Err(e) => response(
             "unknown".into(),
             Err(error("ERR_INVALID_REQUEST", e.to_string())),
@@ -133,6 +203,9 @@ fn main() -> std::io::Result<()> {
         .nth(2)
         .unwrap_or_else(|| "examples/research-gateway.toml".into());
     let config = GatewayConfig::load(&config_path).map_err(std::io::Error::other)?;
+    let search_key = config
+        .resolved_search_key()
+        .map_err(std::io::Error::other)?;
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
     eprintln!(
@@ -142,7 +215,7 @@ fn main() -> std::io::Result<()> {
     let policy = config.policy();
     let remaining = AtomicU32::new(config.max_requests);
     for stream in listener.incoming().flatten() {
-        let _ = serve(stream, &policy, &remaining);
+        let _ = serve(stream, &policy, &remaining, search_key.as_deref());
     }
     Ok(())
 }
@@ -164,6 +237,64 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    fn base_config(name: &str, search_table: &str) -> GatewayConfig {
+        let path = format!(
+            "/tmp/viper-search-config-test-{name}-{}.toml",
+            std::process::id()
+        );
+        std::fs::write(
+            &path,
+            format!(
+                "schema='viper-boxd.research-gateway.v0'\ngateway_id='x'\nallowed_domains=['x']\nmax_requests=1\nmax_fetch_bytes=1\nmax_redirects=0\ntimeout_seconds=1\n{search_table}"
+            ),
+        )
+        .unwrap();
+        let config = GatewayConfig::load(&path).expect("valid base config");
+        let _ = std::fs::remove_file(&path);
+        config
+    }
+
+    #[test]
+    fn no_search_table_resolves_to_none() {
+        let config = base_config("no-search", "");
+        assert!(config.resolved_search_key().expect("resolves").is_none());
+    }
+
+    #[test]
+    fn unsupported_search_provider_is_rejected() {
+        let config = base_config(
+            "bad-provider",
+            "[search]\nprovider='google'\napi_key_env='X'\n",
+        );
+        assert!(config.resolved_search_key().is_err());
+    }
+
+    #[test]
+    fn configured_search_without_the_env_var_set_is_rejected() {
+        let env_var = "VIPER_TEST_SEARCH_KEY_UNSET";
+        std::env::remove_var(env_var);
+        let config = base_config(
+            "key-unset",
+            &format!("[search]\nprovider='brave'\napi_key_env='{env_var}'\n"),
+        );
+        assert!(config.resolved_search_key().is_err());
+    }
+
+    #[test]
+    fn configured_search_reads_the_key_from_its_named_env_var() {
+        let env_var = "VIPER_TEST_SEARCH_KEY_SET";
+        std::env::set_var(env_var, "test-key-value");
+        let config = base_config(
+            "key-set",
+            &format!("[search]\nprovider='brave'\napi_key_env='{env_var}'\n"),
+        );
+        assert_eq!(
+            config.resolved_search_key().expect("resolves"),
+            Some("test-key-value".to_owned())
+        );
+        std::env::remove_var(env_var);
+    }
+
     fn request(method: &str, params: serde_json::Value) -> Request {
         Request {
             version: IPC_VERSION.into(),
@@ -178,14 +309,14 @@ mod tests {
         let policy = ResearchPolicy::mock();
         let budget = AtomicU32::new(2);
         assert_eq!(
-            handle(request("FETCH", json!({})), &policy, &budget)
+            handle(request("FETCH", json!({})), &policy, &budget, None)
                 .error
                 .unwrap()
                 .code,
             "ERR_INVALID_REQUEST"
         );
         assert_eq!(
-            handle(request("SEARCH", json!({"query":"x"})), &policy, &budget)
+            handle(request("SEARCH", json!({"query":"x"})), &policy, &budget, None)
                 .error
                 .unwrap()
                 .code,
@@ -201,6 +332,7 @@ mod tests {
             request("FETCH", json!({"url":"https://not-allowlisted.invalid"})),
             &policy,
             &budget,
+            None,
         );
         assert!(!first.ok);
         assert_eq!(budget.load(std::sync::atomic::Ordering::Acquire), 0);
@@ -208,8 +340,33 @@ mod tests {
             request("FETCH", json!({"url":"https://example.invalid"})),
             &policy,
             &budget,
+            None,
         );
         assert_eq!(second.error.unwrap().code, "ERR_REQUEST_LIMIT_EXCEEDED");
+    }
+
+    #[test]
+    fn search_also_consumes_the_shared_request_budget() {
+        let policy = ResearchPolicy::mock();
+        let budget = AtomicU32::new(1);
+        let first = handle(request("SEARCH", json!({"query":"x"})), &policy, &budget, None);
+        assert!(!first.ok);
+        assert_eq!(budget.load(std::sync::atomic::Ordering::Acquire), 0);
+        let second = handle(request("SEARCH", json!({"query":"x"})), &policy, &budget, None);
+        assert_eq!(second.error.unwrap().code, "ERR_REQUEST_LIMIT_EXCEEDED");
+    }
+
+    #[test]
+    fn configured_search_still_validates_the_query_before_any_transport_call() {
+        let policy = ResearchPolicy::mock();
+        let budget = AtomicU32::new(2);
+        let response = handle(
+            request("SEARCH", json!({})),
+            &policy,
+            &budget,
+            Some("fake-key-never-sent"),
+        );
+        assert_eq!(response.error.unwrap().code, "ERR_INVALID_REQUEST");
     }
 
     #[test]
@@ -223,6 +380,7 @@ mod tests {
             ),
             &policy,
             &budget,
+            None,
         );
         assert_eq!(response.error.unwrap().code, "ERR_TOOL_NOT_ALLOWED");
     }

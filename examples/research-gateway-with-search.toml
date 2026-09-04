@@ -1,0 +1,16 @@
+schema = "viper-boxd.research-gateway.v0"
+gateway_id = "RESEARCH_PUBLIC_WEB_V1"
+allowed_domains = ["example.org"]
+max_requests = 30
+max_fetch_bytes = 5242880
+max_redirects = 0
+timeout_seconds = 10
+
+# SEARCH is opt-in. Without this table the gateway returns
+# ERR_NOT_IMPLEMENTED exactly as it always has, so the base
+# examples/research-gateway.toml stays keyless. The key itself is never
+# written here: the gateway reads it from the named environment variable at
+# startup and fails closed at startup if that variable is unset or empty.
+[search]
+provider = "brave"
+api_key_env = "BRAVE_SEARCH_API_KEY"

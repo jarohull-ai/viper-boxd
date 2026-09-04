@@ -43,7 +43,10 @@ callers, the same as `ERR_UNSUPPORTED_SCHEMA`.
 | `ERR_UNSUPPORTED_SCHEMA` | any gateway | `version` did not match `IPC_VERSION`. |
 | `ERR_INVALID_REQUEST` | any gateway | Request body was malformed or missing a required param (`url`, `query`, `prompt`). |
 | `ERR_TOOL_NOT_ALLOWED` | any gateway | `method` is not one this gateway serves. |
-| `ERR_NOT_IMPLEMENTED` | research gateway | Method is contractually valid but has no live provider yet (e.g. `SEARCH`). |
+| `ERR_NOT_IMPLEMENTED` | research gateway | Method is contractually valid but no provider is configured for it (`SEARCH` with no `[search]` table). |
+| `ERR_SEARCH_QUERY_INVALID` | search provider | `params.query` was missing, empty, or unreasonably long. |
+| `ERR_SEARCH_FAILED` | search provider | The search provider request failed at the transport level (DNS, TLS, connect, timeout, non-2xx status). |
+| `ERR_SEARCH_RESPONSE_INVALID` | search provider | The search provider's response was not the expected JSON shape. |
 | `ERR_REQUEST_LIMIT_EXCEEDED` | research gateway | `max_requests` budget for the process is exhausted. |
 | `ERR_INVALID_URL` | research policy | `params.url` failed to parse as a URL. |
 | `ERR_URL_SCHEME_DENIED` | research policy | Scheme other than `https`. |
