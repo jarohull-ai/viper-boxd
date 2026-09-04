@@ -6,10 +6,24 @@ mock implementation. It does not perform network requests or hold secrets.
 
 ## Transport
 
-- Unix socket, one JSON request and one JSON response per line.
+- Unix socket, one JSON request and one JSON response per line (a
+  streaming `MODEL_GENERATE` call gets a sequence of `StreamChunk` frames
+  instead — see `STREAM_PLAN.md`).
 - `version` must be `1.0`; unsupported versions fail closed.
 - Requests contain `request_id`, `method`, and `params`.
 - Supported methods are `SEARCH`, `FETCH`, `MODEL_GENERATE`, and `EMBED`.
+- Every gateway and the helper bind their socket with `ipc::bind_unix_socket`,
+  which restricts it to `0600` rather than depending on the binding
+  process's umask — a socket left at umask-derived permissions could admit
+  any local user or group member as a caller, bypassing `viper-boxd`
+  entirely, which matters most for a gateway holding a real provider key.
+- Every accepted connection gets `ipc::configure_server_stream`'s read/write
+  timeout (`SERVER_IO_TIMEOUT`) and every line read on either side of the
+  wire is bounded by `ipc::MAX_LINE_BYTES` (`ipc::bind_unix_socket`'s
+  companion helpers): every gateway here accepts connections on a single
+  thread, so an unbounded blocking write or an unbounded `read_line` from
+  one stalled or hostile peer would otherwise stall every other caller of
+  that gateway, not just itself.
 
 ## Request rules
 

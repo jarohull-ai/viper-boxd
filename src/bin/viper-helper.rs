@@ -3,10 +3,10 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::{
         fs::FileTypeExt,
-        net::{UnixListener, UnixStream},
+        net::UnixStream,
     },
     process::Command,
     sync::{Arc, Mutex},
@@ -462,9 +462,17 @@ fn handle(request: Request, states: &States, gateways: &GatewayRegistry) -> Resp
                 Some(_) if states.lock().expect("state lock").contains_key(box_id) => {
                     Err(error("ERR_DUPLICATE_BOX", "box already exists"))
                 }
+                // status/kill/cleanup and the spawn watchdog all shell out
+                // to systemctl directly, unconditionally - a Box must not
+                // be allowed to start unless the full lifecycle, not just
+                // the initial spawn, can be enforced.
                 Some(_unit) if !command_available("systemd-run") => Err(error(
                     "ERR_CAPABILITY_UNAVAILABLE",
                     "systemd-run is not available",
+                )),
+                Some(_unit) if !command_available("systemctl") => Err(error(
+                    "ERR_CAPABILITY_UNAVAILABLE",
+                    "systemctl is not available",
                 )),
                 Some(unit) => {
                     let (cpu, memory) = limits;
@@ -693,7 +701,9 @@ fn handle(request: Request, states: &States, gateways: &GatewayRegistry) -> Resp
 }
 fn serve(mut stream: UnixStream, states: &States, gateways: &GatewayRegistry) -> std::io::Result<()> {
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    BufReader::new(stream.try_clone()?)
+        .take(viper_boxd::ipc::MAX_LINE_BYTES)
+        .read_line(&mut line)?;
     let reply = match serde_json::from_str::<Request>(&line) {
         Ok(req) => handle(req, states, gateways),
         Err(e) => response(
@@ -713,13 +723,15 @@ fn main() -> std::io::Result<()> {
         .nth(2)
         .unwrap_or_else(|| "examples/gateway-registry.toml".into());
     let gateways = load_gateway_registry(&registry_path).map_err(std::io::Error::other)?;
-    let _ = fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
+    let listener = viper_boxd::ipc::bind_unix_socket(&socket)?;
     eprintln!("viper-helper listening on {socket}");
     let states: States = Arc::new(Mutex::new(BTreeMap::new()));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                if viper_boxd::ipc::configure_server_stream(&stream).is_err() {
+                    continue;
+                }
                 if let Err(e) = serve(stream, &states, &gateways) {
                     eprintln!("helper connection error: {e}");
                 }

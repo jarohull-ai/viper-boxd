@@ -2,12 +2,55 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     fmt,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub const IPC_VERSION: &str = "1.0";
+
+/// Bound on any single JSON-line read (request, response, or stream
+/// chunk), on both the server and client side. Generous relative to real
+/// payloads (prompts are capped far below this by each gateway's own
+/// `max_prompt_chars`), but finite: an unbounded `read_line` lets a
+/// malformed or hostile peer grow a buffer without limit. Hitting the
+/// limit mid-line yields a truncated, non-JSON line, which the existing
+/// parse-error handling on both sides already rejects — no separate
+/// error path is needed for it.
+pub const MAX_LINE_BYTES: u64 = 1024 * 1024;
+
+/// How long a single blocking read or write on an accepted server
+/// connection may take before it is abandoned. Bounds the damage a peer
+/// that stops reading (or never finishes sending) can do: without this,
+/// `serve`'s blocking writes have no upper bound, and every gateway here
+/// accepts connections on a single thread, so one stuck peer would stall
+/// every other caller, not just itself.
+#[cfg(unix)]
+pub const SERVER_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Removes any stale socket at `path`, binds a fresh one, and restricts it
+/// to the owning user (`0600`) rather than leaving it at the process's
+/// umask — a Unix socket file's default permissions are not something
+/// this code should depend on an external, per-deployment setting for,
+/// especially for a gateway holding a real provider API key.
+#[cfg(unix)]
+pub fn bind_unix_socket(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::remove_file(path);
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+/// Applies `SERVER_IO_TIMEOUT` to a freshly accepted connection. Every
+/// gateway and the helper should call this immediately after `accept`,
+/// before doing anything else with the stream.
+#[cfg(unix)]
+pub fn configure_server_stream(stream: &std::os::unix::net::UnixStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(SERVER_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(SERVER_IO_TIMEOUT))?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -156,6 +199,7 @@ pub fn send_request(socket_path: &str, request: &Request) -> Result<Response, Cl
     stream.flush().map_err(ClientError::Io)?;
     let mut line = String::new();
     BufReader::new(stream)
+        .take(MAX_LINE_BYTES)
         .read_line(&mut line)
         .map_err(ClientError::Io)?;
     if line.trim().is_empty() {
@@ -196,8 +240,12 @@ pub fn send_streaming_request(
         writer.write_all(b"\n").map_err(ClientError::Io)?;
         writer.flush().map_err(ClientError::Io)?;
     }
-    let mut reader = BufReader::new(stream);
+    // The per-line cap is reset before every read: a legitimate stream may
+    // have many chunks in total, but each individual line must still be
+    // bounded.
+    let mut reader = BufReader::new(stream).take(MAX_LINE_BYTES);
     loop {
+        reader.set_limit(MAX_LINE_BYTES);
         let mut line = String::new();
         let bytes_read = reader.read_line(&mut line).map_err(ClientError::Io)?;
         if bytes_read == 0 {
@@ -231,8 +279,8 @@ pub fn send_streaming_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        generate_audit_trace_id, ipc_error, respond, send_streaming_request, stream_chunk,
-        Request, IPC_VERSION,
+        generate_audit_trace_id, ipc_error, respond, send_request, send_streaming_request,
+        stream_chunk, Request, IPC_VERSION, MAX_LINE_BYTES,
     };
     use serde_json::json;
     use std::{
@@ -281,6 +329,55 @@ mod tests {
             "viper-boxd-ipc-test-{name}-{}.sock",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn send_request_stops_reading_at_the_line_size_cap_instead_of_growing_unbounded() {
+        let path = temp_socket("oversized-response");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept test connection");
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().expect("clone stream"))
+                .read_line(&mut line)
+                .expect("read request line");
+            // No newline, far more than the cap: a hostile or broken peer
+            // trying to make the reader grow without bound. Written in
+            // chunks and stopped as soon as a write fails, which happens
+            // once the client disconnects after hitting the cap - if the
+            // cap were broken and the client tried to read all of this,
+            // the loop completes anyway (100 MiB, not truly infinite), it
+            // would just take far longer than the elapsed-time assertion
+            // below allows.
+            let chunk = vec![b'x'; 65536];
+            for _ in 0..1600 {
+                if stream.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let request = Request {
+            version: IPC_VERSION.into(),
+            request_id: "req-1".into(),
+            method: "status".into(),
+            params: json!({}),
+        };
+        let start = std::time::Instant::now();
+        let result = send_request(path.to_str().unwrap(), &request);
+        let elapsed = start.elapsed();
+        server.join().expect("server thread completes");
+        let _ = std::fs::remove_file(&path);
+
+        // Truncated at the cap, no trailing newline or valid JSON: must be
+        // rejected, not hang or silently succeed.
+        assert!(result.is_err());
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "stopping at the {MAX_LINE_BYTES}-byte cap should be fast, not read the full \
+             oversized stream or wait out send_request's 5s timeout (took {elapsed:?})"
+        );
     }
 
     fn serve_chunks(

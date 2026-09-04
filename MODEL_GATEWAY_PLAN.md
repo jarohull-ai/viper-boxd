@@ -25,13 +25,14 @@ the research gateway.
   works (verified live, 768-dimension vectors). Not added to the mock
   gateway (`viper-gateway-mock`), which still only serves `SEARCH`,
   `FETCH`, and `MODEL_GENERATE`.
-- Streaming (token-by-token output) is explicitly **not** a method name.
-  The current IPC contract is one JSON request to exactly one JSON response
-  per line (`ipc::send_request` reads one line and returns); token
-  streaming needs a different transport shape (multiple response frames, or
-  a persistent connection) and is a separate architectural decision, not an
-  incremental addition. Out of scope until that decision is made
-  deliberately.
+- Streaming (token-by-token output) is explicitly **not** a method name —
+  it is `params.stream: true` on `MODEL_GENERATE`. It required a real
+  transport-shape change (multiple `StreamChunk` frames per request instead
+  of one `Response`), which was deliberately treated as a separate
+  architectural decision rather than an incremental addition. That decision
+  is made and implemented, for all four providers; see
+  [STREAM_PLAN.md](STREAM_PLAN.md) for the design and verification detail
+  rather than duplicating it here.
 
 ## Response classification
 
@@ -76,7 +77,13 @@ provider (see `SEARCH_PROVIDER_PLAN.md`). `ollama` needs no key;
 `api_key_env` is optional and simply unused when `provider = "ollama"`. The
 key is read once at gateway startup and held only in the gateway process's
 own memory; it is never written to a config file, logged, or returned to a
-caller.
+caller. `GatewayConfig::load` also requires `endpoint` to start with
+`https://` for these three providers — the key would otherwise cross the
+network in plaintext on a misconfigured `http://` endpoint, a config typo
+that would ship a real secret in the clear rather than merely fail loudly.
+`ollama`'s `endpoint` is unrestricted (`http://127.0.0.1:11434` by default):
+it is expected to run on an admin-chosen local or private address, not a
+provider requiring a bearer token.
 
 `EMBED` is implemented for `ollama`, `openai`, and `openrouter`.
 `OpenAiCompatibleEmbedTransport` (`POST {endpoint}/embeddings`, Bearer auth)

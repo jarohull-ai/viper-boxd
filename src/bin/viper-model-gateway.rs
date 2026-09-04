@@ -2,8 +2,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::{
     env, fs,
-    io::{BufRead, BufReader, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::net::UnixStream,
     sync::atomic::{AtomicU32, Ordering},
 };
 use viper_boxd::{
@@ -76,6 +76,15 @@ impl GatewayConfig {
             return Err(format!(
                 "provider {} requires api_key_env",
                 config.provider
+            ));
+        }
+        // A keyed provider's API key must never cross the network in
+        // plaintext. ollama stays unrestricted: it is expected to run on
+        // an admin-chosen local or private endpoint, http:// included.
+        if requires_key && !config.endpoint.starts_with("https://") {
+            return Err(format!(
+                "provider {} requires an https:// endpoint (got {})",
+                config.provider, config.endpoint
             ));
         }
         if let Some(embed) = &config.embed {
@@ -403,7 +412,9 @@ fn serve(
     api_key: Option<&str>,
 ) -> std::io::Result<()> {
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    BufReader::new(stream.try_clone()?)
+        .take(viper_boxd::ipc::MAX_LINE_BYTES)
+        .read_line(&mut line)?;
     let request: Request = match serde_json::from_str(&line) {
         Ok(request) => request,
         Err(e) => {
@@ -438,14 +449,16 @@ fn main() -> std::io::Result<()> {
         .unwrap_or_else(|| "examples/model-gateway.toml".into());
     let config = GatewayConfig::load(&config_path).map_err(std::io::Error::other)?;
     let api_key = config.resolved_api_key().map_err(std::io::Error::other)?;
-    let _ = fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
+    let listener = viper_boxd::ipc::bind_unix_socket(&socket)?;
     eprintln!(
         "viper-model-gateway listening on {socket} ({})",
         config.gateway_id
     );
     let remaining = AtomicU32::new(config.max_requests);
     for stream in listener.incoming().flatten() {
+        if viper_boxd::ipc::configure_server_stream(&stream).is_err() {
+            continue;
+        }
         let _ = serve(stream, &config, &remaining, api_key.as_deref());
     }
     Ok(())
@@ -479,6 +492,23 @@ mod tests {
         let path = "/tmp/viper-keyed-no-env-model-gateway.toml";
         std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='openai'\nendpoint='https://api.openai.com/v1'\nmodel='gpt-4o-mini'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n").unwrap();
         assert!(GatewayConfig::load(path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn keyed_provider_with_a_plaintext_endpoint_is_rejected() {
+        let path = "/tmp/viper-keyed-http-endpoint-model-gateway.toml";
+        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='openai'\nendpoint='http://api.openai.com/v1'\nmodel='gpt-4o-mini'\napi_key_env='X'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n").unwrap();
+        let error = GatewayConfig::load(path).expect_err("a plaintext endpoint for a keyed provider must be rejected");
+        assert!(error.contains("https://"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ollama_may_use_a_plaintext_endpoint() {
+        let path = "/tmp/viper-ollama-http-endpoint-model-gateway.toml";
+        std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='ollama'\nendpoint='http://127.0.0.1:11434'\nmodel='mistral:7b'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n").unwrap();
+        assert!(GatewayConfig::load(path).is_ok());
         let _ = std::fs::remove_file(path);
     }
 

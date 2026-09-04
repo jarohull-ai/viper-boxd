@@ -1,9 +1,9 @@
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
-    env, fs,
-    io::{BufRead, BufReader, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    env,
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::net::UnixStream,
 };
 use viper_boxd::{
     capabilities::CapabilityReport,
@@ -109,7 +109,9 @@ fn serve_connection(
     capability_report: &CapabilityReport,
 ) -> std::io::Result<()> {
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    BufReader::new(stream.try_clone()?)
+        .take(viper_boxd::ipc::MAX_LINE_BYTES)
+        .read_line(&mut line)?;
     let response = match serde_json::from_str::<Request>(&line) {
         Ok(request) => handle(request, states, capability_report),
         Err(parse_error) => response(
@@ -126,14 +128,16 @@ fn main() -> std::io::Result<()> {
     let socket = env::args()
         .nth(1)
         .unwrap_or_else(|| "/tmp/viper-helper-mock.sock".into());
-    let _ = fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
+    let listener = viper_boxd::ipc::bind_unix_socket(&socket)?;
     eprintln!("viper-helper-mock listening on {socket}");
     let mut states = BTreeMap::new();
     let capability_report = viper_boxd::capabilities::probe();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                if viper_boxd::ipc::configure_server_stream(&stream).is_err() {
+                    continue;
+                }
                 if let Err(error) = serve_connection(stream, &mut states, &capability_report) {
                     eprintln!("mock helper connection error: {error}");
                 }

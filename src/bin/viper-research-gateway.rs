@@ -2,8 +2,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::{
     env, fs,
-    io::{BufRead, BufReader, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::net::UnixStream,
     sync::atomic::{AtomicU32, Ordering},
 };
 use viper_boxd::{
@@ -182,7 +182,9 @@ fn serve(
     search_key: Option<&str>,
 ) -> std::io::Result<()> {
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    BufReader::new(stream.try_clone()?)
+        .take(viper_boxd::ipc::MAX_LINE_BYTES)
+        .read_line(&mut line)?;
     let reply = match serde_json::from_str::<Request>(&line) {
         Ok(request) => handle(request, policy, remaining, search_key),
         Err(e) => response(
@@ -206,8 +208,7 @@ fn main() -> std::io::Result<()> {
     let search_key = config
         .resolved_search_key()
         .map_err(std::io::Error::other)?;
-    let _ = fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
+    let listener = viper_boxd::ipc::bind_unix_socket(&socket)?;
     eprintln!(
         "viper-research-gateway listening on {socket} ({})",
         config.gateway_id
@@ -215,6 +216,9 @@ fn main() -> std::io::Result<()> {
     let policy = config.policy();
     let remaining = AtomicU32::new(config.max_requests);
     for stream in listener.incoming().flatten() {
+        if viper_boxd::ipc::configure_server_stream(&stream).is_err() {
+            continue;
+        }
         let _ = serve(stream, &policy, &remaining, search_key.as_deref());
     }
     Ok(())

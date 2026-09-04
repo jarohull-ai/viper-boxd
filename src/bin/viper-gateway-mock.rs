@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
 use std::{
-    env, fs,
-    io::{BufRead, BufReader, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    env,
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::net::UnixStream,
 };
 use viper_boxd::ipc::{ipc_error as error, respond as response, Request, Response, IPC_VERSION};
 use viper_boxd::research_policy::{sanitize_html, ResearchPolicy};
@@ -40,7 +40,9 @@ fn handle(request: Request) -> Response {
 
 fn serve(mut stream: UnixStream) -> std::io::Result<()> {
     let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    BufReader::new(stream.try_clone()?)
+        .take(viper_boxd::ipc::MAX_LINE_BYTES)
+        .read_line(&mut line)?;
     let reply = match serde_json::from_str::<Request>(&line) {
         Ok(request) => handle(request),
         Err(e) => response(
@@ -57,10 +59,12 @@ fn main() -> std::io::Result<()> {
     let socket = env::args()
         .nth(1)
         .unwrap_or_else(|| "/tmp/viper-gateway-mock.sock".into());
-    let _ = fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
+    let listener = viper_boxd::ipc::bind_unix_socket(&socket)?;
     eprintln!("viper-gateway-mock listening on {socket}");
     for stream in listener.incoming().flatten() {
+        if viper_boxd::ipc::configure_server_stream(&stream).is_err() {
+            continue;
+        }
         let _ = serve(stream);
     }
     Ok(())
