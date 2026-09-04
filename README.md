@@ -219,6 +219,29 @@ The key is read from the environment at startup and never written to a
 config file or returned to a caller; a configured provider with an unset or
 empty key variable is a startup error, not a silently disabled feature.
 
+### Model gateway
+
+A separate gateway process and socket, matching the `MODEL:*` gateway
+namespace manifests already reference (`VIPER_LOCAL_OLLAMA_V1`). Its design,
+including why streaming and paid providers are explicitly out of scope for
+now, is documented in [MODEL_GATEWAY_PLAN.md](MODEL_GATEWAY_PLAN.md).
+
+```bash
+cargo build --bins
+cargo run --bin viper-model-gateway -- /tmp/viper-model-gateway.sock \
+  examples/model-gateway.toml
+```
+
+It requires a local Ollama instance (`http://127.0.0.1:11434` by default,
+see `examples/model-gateway.toml`) and exposes only `MODEL_GENERATE`.
+Successful responses are classified `MODEL_OUTPUT`, matching
+`GATEWAY_CONTRACT.md`; a model's output is never pre-classified as trusted.
+Generation length is bounded server-side by `max_output_tokens`, and
+`max_requests` is enforced the same way as the research gateway's shared
+budget. `examples/gateway-registry.toml` maps `VIPER_LOCAL_OLLAMA_V1` to
+this gateway's socket so `viper-helper` can bind-mount it into a Box the
+same way it already does for the research gateway.
+
 ## Backend decision
 
 The planned first real backend is a separate `viper-helper` system service

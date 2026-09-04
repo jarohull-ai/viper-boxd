@@ -47,6 +47,9 @@ callers, the same as `ERR_UNSUPPORTED_SCHEMA`.
 | `ERR_SEARCH_QUERY_INVALID` | search provider | `params.query` was missing, empty, or unreasonably long. |
 | `ERR_SEARCH_FAILED` | search provider | The search provider request failed at the transport level (DNS, TLS, connect, timeout, non-2xx status). |
 | `ERR_SEARCH_RESPONSE_INVALID` | search provider | The search provider's response was not the expected JSON shape. |
+| `ERR_MODEL_PROMPT_INVALID` | model gateway | `params.prompt` was missing, empty, or exceeded the configured length. |
+| `ERR_MODEL_FAILED` | model gateway | The model provider request failed at the transport level. |
+| `ERR_MODEL_RESPONSE_INVALID` | model gateway | The model provider's response was not the expected JSON shape. |
 | `ERR_REQUEST_LIMIT_EXCEEDED` | research gateway | `max_requests` budget for the process is exhausted. |
 | `ERR_INVALID_URL` | research policy | `params.url` failed to parse as a URL. |
 | `ERR_URL_SCHEME_DENIED` | research policy | Scheme other than `https`. |

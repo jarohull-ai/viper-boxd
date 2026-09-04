@@ -8,3 +8,4 @@ schema = "viper-boxd.gateway-registry.v0"
 [gateways]
 RESEARCH_PUBLIC_WEB_V1 = "/tmp/viper-research-gateway.sock"
 MOCK_RESEARCH_V0 = "/tmp/viper-gateway-mock.sock"
+VIPER_LOCAL_OLLAMA_V1 = "/tmp/viper-model-gateway.sock"
