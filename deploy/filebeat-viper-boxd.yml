@@ -1,0 +1,15 @@
+# Install under /etc/filebeat/inputs.d/viper-boxd.yml after Filebeat and an
+# authenticated Elasticsearch output are configured by the administrator.
+filebeat.inputs:
+  - type: filestream
+    id: viper-boxd-audit
+    enabled: true
+    paths:
+      - /var/log/viper-boxd/audit.jsonl
+    parsers:
+      - ndjson:
+          target: ""
+          add_error_key: true
+
+# Deliberately no `output.elasticsearch` credentials are included here.
+# Configure that in the administrator-managed Filebeat output configuration.

@@ -154,6 +154,116 @@ The expected result contains `external_network_blocked: true` and
 `local_network_blocked: true`. Any `network_mode` other than `DENY` or
 `GATEWAY_ONLY` is rejected fail-closed.
 
+### Signal isolation probe
+
+The helper applies a deny-list `SystemCallFilter=` for the Linux signal
+delivery syscalls (`kill`, `tkill`, `tgkill`, queued-signal and pidfd forms).
+The signal probe runs `viper-signal-probe` in a transient unit and attempts
+`kill -0` (a permission check only, no signal is delivered) against its own
+PID and the helper's PID:
+
+```bash
+cargo build --bins
+cargo run --bin viper-helper -- /tmp/viper-helper.sock
+cargo run -- signal-probe --socket /tmp/viper-helper.sock
+```
+
+The expected result contains `self_signal_denied: true` and
+`target_signal_denied: true`. Lifecycle remains available through systemd's
+cgroup stop operation; a Box cannot use host signal syscalls. This command has
+intentional side effects: it creates one transient systemd unit. Either false
+value is a real leak, not a probe defect.
+
+### Resource limit probe
+
+The helper sets `CPUQuota=` and `MemoryMax=` on every spawned unit, but
+neither is exercised by the other probes. The resource probe runs
+`viper-resource-probe` in a transient unit with fixed test limits
+(`CPUQuota=20%`, `MemoryMax=64MiB`) and checks that both are actually
+enforced by the kernel, not just configured: a CPU-bound busy loop's
+CPU-time/wall-time ratio (read from `/proc/self/stat`) must stay well
+below 1.0, and a disposable child process that tries to allocate and
+touch memory well past the limit must be killed by the kernel (or aborted
+by the allocator) before it finishes - a fixed, bounded attempt, not an
+open-ended one:
+
+```bash
+cargo build --bins
+cargo run --bin viper-helper -- /tmp/viper-helper.sock
+cargo run -- resource-probe --socket /tmp/viper-helper.sock
+```
+
+The expected result contains `cpu_quota_enforced: true` and
+`memory_limit_enforced: true`. The memory check's child runs in the same
+cgroup as its parent. It writes every requested page and reports both its RSS
+and touched-page count; enforcement is proven either by an OOM signal or by a
+resident set capped at the configured limit after all pages were touched.
+This handles supported kernels that cap the child without propagating an OOM
+signal to its parent.
+
+### Phase-2 runtime state and observability
+
+`viper-boxd::lineage` persists versioned parent/child policy snapshots as
+atomic owner-only JSON files. The intended service directory is
+`/var/lib/viper-boxd/lineage`; tests must use an explicit temporary directory.
+Corrupt records, unknown parents and policy broadening fail closed on reload.
+
+`viper-boxd::admission` has a default global capacity of 50 active Boxes and
+a FIFO queue. `VIPER_MAX_ACTIVE_BOXES` configures the helper limit. Helper IPC
+exposes `admission/status` and `admission/drain`. A successful `kill` or TTL
+expiry frees one slot and drains FIFO work; queued requests can be cancelled by
+`kill` or `cleanup` before they start.
+
+`viper-boxd::observability` emits JSONL records suitable for Filebeat and
+formats Prometheus text metrics (`viper_boxes_active`, queue, CPU/RAM limits
+and model-cost counter). The administrator-facing Filebeat input template is
+[`deploy/filebeat-viper-boxd.yml`](deploy/filebeat-viper-boxd.yml). It contains
+no Elasticsearch URL or credentials; those remain administrator configuration.
+Set `VIPER_AUDIT_LOG=/var/log/viper-boxd/audit.jsonl` for helper IPC audit
+events, then request helper method `metrics` to obtain the Prometheus text
+payload. Filebeat and Elasticsearch are deployment dependencies, not embedded
+in the helper.
+
+### Phase-3 recovery, CI and time audit
+
+On startup, `viper-helper` opens the lineage store
+(`/var/lib/viper-boxd/lineage` by default, or `VIPER_LINEAGE_DIR`) before
+binding its IPC socket. If the directory exists, the helper scans active
+`viper-box-*.service` user units through systemd. A unit with no matching
+lineage record is treated as an orphan: the helper stops it, resets failed
+state, removes its deterministic runtime scratch directory, and emits an
+`orphan_box_reconciled` JSONL audit event when `VIPER_AUDIT_LOG` is set. If
+any part of that kill/cleanup sequence fails, helper startup fails closed.
+
+Audit JSONL entries now include both UTC wall-clock time and operation
+duration:
+
+```json
+{"schema":"viper-boxd.audit.v0","timestamp":"2026-09-05T16:59:23Z","timestamp_unix_ms":1788627563191,"duration_ms":7,"event":"helper_ipc","fields":{}}
+```
+
+`timestamp` is formatted as UTC independent of the local timezone.
+`duration_ms` is measured from a monotonic timer around the helper operation.
+Time synchronization remains a host deployment requirement; the helper reports
+UTC timestamps but does not configure NTP itself. Operators should verify the
+host with `timedatectl`/chrony/ntpd and alert on unsynchronized clocks.
+
+The GitHub Actions workflow
+`.github/workflows/phase3-security.yml` runs on every push and pull request.
+It builds all binaries, requires a usable systemd user manager, runs the real
+filesystem, network, signal and resource escape probes, and checks that audit
+logs contain UTC `timestamp` and numeric `duration_ms` fields. Hosted runners
+without user-systemd support fail the job instead of silently skipping the
+security probes. The same workflow also runs daily and on manual dispatch; in
+those modes it additionally runs the ignored DoS regression tests in
+`tests/dos_heavy.rs`, including the 100 MiB IPC framing check and 1000-way
+admission stress test.
+
+The fast regression suite also includes `tests/adversarial_inputs.rs`, covering
+overlong paths, control characters in manifests, repetitive malformed
+manifests, missing files, unreadable/corrupt TOML profiles, premature gateway
+disconnects and malformed gateway response types.
+
 ### Gateway-only networking
 
 A Box may be granted access to one or more running gateways without ever
