@@ -252,9 +252,15 @@ The GitHub Actions workflow
 `.github/workflows/phase3-security.yml` runs on every push and pull request.
 It builds all binaries, requires a usable systemd user manager, runs the real
 filesystem, network, signal and resource escape probes, and checks that audit
-logs contain UTC `timestamp` and numeric `duration_ms` fields. Hosted runners
-without user-systemd support fail the job instead of silently skipping the
-security probes. The same workflow also runs daily and on manual dispatch; in
+logs contain UTC `timestamp` and numeric `duration_ms` fields.
+
+Before running the real probes, CI performs a canary check for
+`ProtectHome=read-only` enforcement in a `systemd --user` unit. If the runner
+has a user manager but cannot enforce user-unit mount namespacing, the workflow
+emits a warning and skips the real escape probes on that host. Treat that as an
+environment limitation, not as boundary coverage. Release-gating Phase 3 should
+use a host or self-hosted runner where this canary fails closed and the probes
+actually execute. The same workflow also runs daily and on manual dispatch; in
 those modes it additionally runs the ignored DoS regression tests in
 `tests/dos_heavy.rs`, including the 100 MiB IPC framing check and 1000-way
 admission stress test.

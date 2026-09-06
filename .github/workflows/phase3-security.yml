@@ -37,16 +37,26 @@ jobs:
           run_dir="$(mktemp -d)"
           socket="$run_dir/viper-helper.sock"
           log="$run_dir/audit.jsonl"
+          lineage="$run_dir/lineage"
+          protect_home_canary="$HOME/viper-boxd-protecthome-ci-canary"
           cleanup() {
             if [[ -n "${helper_pid:-}" ]]; then
               kill "$helper_pid" 2>/dev/null || true
               wait "$helper_pid" 2>/dev/null || true
             fi
+            rm -f "$protect_home_canary"
             rm -rf "$run_dir"
           }
           trap cleanup EXIT
+          mkdir -p "$lineage"
 
-          VIPER_AUDIT_LOG="$log" ./target/debug/viper-helper "$socket" &
+          if systemd-run --user --wait --pipe --property ProtectHome=read-only \
+            /usr/bin/sh -c "echo probe > '$protect_home_canary'"; then
+            echo "::warning title=systemd user sandbox unavailable::ProtectHome=read-only was not enforced for a systemd user unit on this runner; real escape probes require a host that can enforce user-unit mount namespacing."
+            exit 0
+          fi
+
+          VIPER_AUDIT_LOG="$log" VIPER_LINEAGE_DIR="$lineage" ./target/debug/viper-helper "$socket" &
           helper_pid=$!
           for _ in $(seq 1 50); do
             [[ -S "$socket" ]] && break
