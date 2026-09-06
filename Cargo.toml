@@ -1,6 +1,6 @@
 [package]
 name = "viper-boxd"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2021"
 description = "Unprivileged simulator for the viper-boxd trusted runner"
 license = "PolyForm-Noncommercial-1.0.0"
