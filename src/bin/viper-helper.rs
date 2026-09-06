@@ -4,24 +4,149 @@ use std::{
     collections::BTreeMap,
     env, fs,
     io::{BufRead, BufReader, Read, Write},
-    os::unix::{
-        fs::FileTypeExt,
-        net::UnixStream,
-    },
+    os::unix::{fs::FileTypeExt, net::UnixStream},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
-use viper_boxd::ipc::{ipc_error as error, respond as response, IpcErrorBody, Request, Response, IPC_VERSION};
+use viper_boxd::admission::{AdmissionController, AdmissionDecision};
+use viper_boxd::ipc::{
+    ipc_error as error, respond as response, IpcErrorBody, Request, Response, IPC_VERSION,
+};
+use viper_boxd::lineage::LineageStore;
+use viper_boxd::observability::{append_jsonl, Metrics};
 
 #[derive(Debug, Clone)]
 struct UnitState {
     unit: String,
     status: String,
     scratch_path: String,
+    cpu_quota_percent: u64,
+    memory_limit_bytes: u64,
 }
 type States = Arc<Mutex<BTreeMap<String, UnitState>>>;
+#[derive(Debug)]
+struct AdmissionState {
+    controller: AdmissionController,
+    pending: BTreeMap<String, Value>,
+}
+type Admissions = Arc<Mutex<AdmissionState>>;
+static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn reconcile_orphaned_boxes(lineage_dir: &std::path::Path) -> Result<usize, String> {
+    let store = LineageStore::open(lineage_dir).map_err(|error| error.to_string())?;
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "--type=service",
+            "--state=active",
+            "viper-box-*.service",
+            "--no-legend",
+            "--plain",
+        ])
+        .output()
+        .map_err(|error| format!("list active Box units: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "list active Box units failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut reconciled = 0;
+    for unit in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|unit| unit.starts_with("viper-box-") && unit.ends_with(".service"))
+    {
+        let box_id = unit
+            .strip_prefix("viper-box-")
+            .and_then(|value| value.strip_suffix(".service"))
+            .unwrap_or_default();
+        if store.get(box_id).is_some() {
+            continue;
+        }
+        let started_at = Instant::now();
+        let stop = Command::new("systemctl")
+            .args(["--user", "stop", unit])
+            .status()
+            .map_err(|error| format!("stop orphan {unit}: {error}"))?;
+        let reset = Command::new("systemctl")
+            .args(["--user", "reset-failed", unit])
+            .output()
+            .map_err(|error| format!("cleanup orphan {unit}: {error}"))?;
+        let reset_ok =
+            reset.status.success() || String::from_utf8_lossy(&reset.stderr).contains("not loaded");
+        let scratch = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".to_owned());
+        let unit_name = unit.strip_suffix(".service").unwrap_or(unit);
+        let scratch =
+            std::path::Path::new(&scratch).join(format!("viper-boxd-scratch-{unit_name}"));
+        let scratch_cleanup = match fs::remove_dir_all(&scratch) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        let fields = json!({
+            "box_id": box_id,
+            "unit": unit,
+            "action": "kill_cleanup",
+            "stop_ok": stop.success(),
+            "reset_failed_ok": reset_ok,
+            "scratch_cleanup_ok": scratch_cleanup,
+        });
+        if let Some(path) = env::var_os("VIPER_AUDIT_LOG") {
+            append_jsonl(
+                std::path::Path::new(&path),
+                "orphan_box_reconciled",
+                &fields,
+                started_at.elapsed().as_millis(),
+            )
+            .map_err(|error| format!("write orphan audit: {error}"))?;
+        }
+        eprintln!(
+            "viper-helper: reconciled orphan Box {box_id} (stop={}, cleanup={})",
+            stop.success(),
+            reset_ok && scratch_cleanup
+        );
+        if !stop.success() || !reset_ok || !scratch_cleanup {
+            return Err(format!(
+                "orphan {unit} did not reconcile cleanly (stop={}, reset_failed={}, scratch_cleanup={})",
+                stop.success(),
+                reset_ok,
+                scratch_cleanup
+            ));
+        }
+        reconciled += 1;
+    }
+    Ok(reconciled)
+}
+
+/// Fixed test limits for the resource-limit probe. Not caller-configurable,
+/// same as the filesystem and network probes' fixed policy.
+const RESOURCE_PROBE_CPU_QUOTA_PERCENT: u64 = 20;
+const RESOURCE_PROBE_MEMORY_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A user-manager unit cannot give every Box a distinct host UID.  These
+/// deny-list entries block all signal delivery from the Box; systemd controls
+/// Box lifecycle through its cgroup instead.
+const SIGNAL_FILTER_PROPERTIES: [&str; 12] = [
+    "--property",
+    "SystemCallFilter=~kill",
+    "--property",
+    "SystemCallFilter=~tkill",
+    "--property",
+    "SystemCallFilter=~tgkill",
+    "--property",
+    "SystemCallFilter=~rt_sigqueueinfo",
+    "--property",
+    "SystemCallFilter=~rt_tgsigqueueinfo",
+    "--property",
+    "SystemCallFilter=~pidfd_send_signal",
+];
 
 /// Administrator-owned mapping from a stable gateway reference to the local
 /// socket of a running gateway process. A spawn request may only name a
@@ -127,6 +252,16 @@ fn command_available(command: &str) -> bool {
         .map(|d| d.join(command))
         .any(|p| p.is_file())
 }
+
+/// The daemon speaks in policy capabilities, never in systemd properties.
+/// Keep this list deliberately small and tied to the properties that this
+/// helper actually sets for every spawned Box.
+fn enforceable_backend_requirement(requirement: &str) -> bool {
+    matches!(
+        requirement,
+        "systemd" | "systemd_run" | "mount_namespace" | "network_policy" | "cgroup_limits"
+    )
+}
 fn safe_unit_name(id: &str) -> Option<String> {
     if id.is_empty()
         || id.len() > 48
@@ -139,17 +274,28 @@ fn safe_unit_name(id: &str) -> Option<String> {
         Some(format!("viper-box-{id}"))
     }
 }
+
+fn probe_unit_name(kind: &str) -> String {
+    let sequence = PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("viper-boxd-{kind}-{}-{sequence}", std::process::id())
+}
 fn command_error(output: std::process::Output, operation: &str, code: &str) -> IpcErrorBody {
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let probe_output = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     error(
         code,
         format!(
-            "{operation} failed{}",
+            "{operation} failed{}{}",
             if detail.is_empty() {
                 String::new()
             } else {
                 format!(": {detail}")
-            }
+            },
+            if probe_output.is_empty() {
+                String::new()
+            } else {
+                format!("; probe output: {probe_output}")
+            },
         ),
     )
 }
@@ -231,10 +377,16 @@ fn start_unit(
         "--property",
         "ProtectSystem=strict",
         "--property",
+        // A user namespace gives the child credentials which cannot signal
+        // same-UID host processes.  If a host disallows this systemd must
+        // fail the spawn; there is no weaker fallback.
+        "PrivateUsers=yes",
+        "--property",
         &writable,
         "--property",
         "PrivateNetwork=yes",
     ]);
+    command.args(SIGNAL_FILTER_PROPERTIES);
     for bind_path in &bind_paths {
         command.arg("--property").arg(bind_path);
     }
@@ -272,7 +424,7 @@ fn run_filesystem_probe(scratch: &str) -> Result<Value, IpcErrorBody> {
                 "viper-fs-probe binary is not built",
             )
         })?;
-    let unit = format!("viper-boxd-probe-{}", std::process::id());
+    let unit = probe_unit_name("filesystem-probe");
     let writable = format!("ReadWritePaths={scratch}");
     let output = Command::new("systemd-run")
         .args([
@@ -290,8 +442,11 @@ fn run_filesystem_probe(scratch: &str) -> Result<Value, IpcErrorBody> {
             "--property",
             "ProtectSystem=strict",
             "--property",
+            "PrivateUsers=yes",
+            "--property",
             &writable,
         ])
+        .args(SIGNAL_FILTER_PROPERTIES)
         .arg(&probe)
         .args(["--scratch", scratch])
         .output()
@@ -318,7 +473,7 @@ fn run_network_probe() -> Result<Value, IpcErrorBody> {
                 "viper-network-probe binary is not built",
             )
         })?;
-    let unit = format!("viper-boxd-network-probe-{}", std::process::id());
+    let unit = probe_unit_name("network-probe");
     let output = Command::new("systemd-run")
         .args([
             "--user",
@@ -331,7 +486,10 @@ fn run_network_probe() -> Result<Value, IpcErrorBody> {
             "ProtectHome=read-only",
             "--property",
             "ProtectSystem=strict",
+            "--property",
+            "PrivateUsers=yes",
         ])
+        .args(SIGNAL_FILTER_PROPERTIES)
         .arg(&probe)
         .output()
         .map_err(|e| error("ERR_PROBE_EXECUTION", e.to_string()))?;
@@ -366,7 +524,7 @@ fn run_gateway_probe(
                 "viper-gateway-probe binary is not built",
             )
         })?;
-    let unit = format!("viper-boxd-gateway-probe-{}", std::process::id());
+    let unit = probe_unit_name("gateway-probe");
     let bind_path = format!("BindPaths={socket}:{socket}");
     let mut command = Command::new("systemd-run");
     command.args([
@@ -381,8 +539,11 @@ fn run_gateway_probe(
         "--property",
         "ProtectSystem=strict",
         "--property",
+        "PrivateUsers=yes",
+        "--property",
         &bind_path,
     ]);
+    command.args(SIGNAL_FILTER_PROPERTIES);
     command.arg(&probe).args(["--socket", socket]);
     if call_method != "PING" {
         command.args(["--call", call_method]);
@@ -397,7 +558,364 @@ fn run_gateway_probe(
         .map_err(|e| error("ERR_PROBE_OUTPUT", e.to_string()))
 }
 
-fn handle(request: Request, states: &States, gateways: &GatewayRegistry) -> Response {
+fn run_signal_probe() -> Result<Value, IpcErrorBody> {
+    let probe = env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("viper-signal-probe")))
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            error(
+                "ERR_PROBE_UNAVAILABLE",
+                "viper-signal-probe binary is not built",
+            )
+        })?;
+    let unit = probe_unit_name("signal-probe");
+    // The target is this helper's own PID: same UID as the probed unit,
+    // but a process the unit must not be able to affect.
+    let target_pid = std::process::id().to_string();
+    let output = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--wait",
+            "--pipe",
+            &format!("--unit={unit}"),
+            "--property",
+            "PrivateNetwork=yes",
+            "--property",
+            "ProtectHome=read-only",
+            "--property",
+            "ProtectSystem=strict",
+            "--property",
+            "PrivateUsers=yes",
+        ])
+        .args(SIGNAL_FILTER_PROPERTIES)
+        .arg(&probe)
+        .args(["--target-pid", &target_pid])
+        .output()
+        .map_err(|e| error("ERR_PROBE_EXECUTION", e.to_string()))?;
+    if !output.status.success() {
+        return Err(command_error(output, "signal probe", "ERR_PROBE_FAILED"));
+    }
+    serde_json::from_slice::<Value>(&output.stdout)
+        .map_err(|e| error("ERR_PROBE_OUTPUT", e.to_string()))
+}
+
+fn run_resource_probe() -> Result<Value, IpcErrorBody> {
+    let probe = env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("viper-resource-probe")))
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            error(
+                "ERR_PROBE_UNAVAILABLE",
+                "viper-resource-probe binary is not built",
+            )
+        })?;
+    let unit = probe_unit_name("resource-probe");
+    let cpu_limit = format!("CPUQuota={RESOURCE_PROBE_CPU_QUOTA_PERCENT}%");
+    let memory_limit = format!("MemoryMax={RESOURCE_PROBE_MEMORY_LIMIT_BYTES}");
+    let output = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--wait",
+            "--pipe",
+            &format!("--unit={unit}"),
+            "--property",
+            "PrivateNetwork=yes",
+            "--property",
+            "ProtectHome=read-only",
+            "--property",
+            "ProtectSystem=strict",
+            "--property",
+            "PrivateUsers=yes",
+            "--property",
+            &cpu_limit,
+            "--property",
+            &memory_limit,
+            "--property",
+            // Systemd's default OOMPolicy tears down every process in the
+            // unit once the kernel OOM-kills any one of them. The memory
+            // check relies on only its disposable child dying, so the
+            // parent survives to report the result.
+            "OOMPolicy=continue",
+        ])
+        .args(SIGNAL_FILTER_PROPERTIES)
+        .arg(&probe)
+        .args([
+            "--cpu-quota-percent",
+            &RESOURCE_PROBE_CPU_QUOTA_PERCENT.to_string(),
+            "--memory-limit-bytes",
+            &RESOURCE_PROBE_MEMORY_LIMIT_BYTES.to_string(),
+        ])
+        .output()
+        .map_err(|e| error("ERR_PROBE_EXECUTION", e.to_string()))?;
+    if !output.status.success() {
+        return Err(command_error(output, "resource probe", "ERR_PROBE_FAILED"));
+    }
+    serde_json::from_slice::<Value>(&output.stdout)
+        .map_err(|e| error("ERR_PROBE_OUTPUT", e.to_string()))
+}
+
+fn spawn_box(
+    params: &Value,
+    states: &States,
+    gateways: &GatewayRegistry,
+    admissions: &Admissions,
+) -> Result<Value, IpcErrorBody> {
+    let box_id = params.get("box_id").and_then(Value::as_str).unwrap_or("");
+    let unsupported = params
+        .get("required_backend")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|values| values.iter())
+        .filter_map(Value::as_str)
+        .filter(|requirement| !enforceable_backend_requirement(requirement))
+        .collect::<Vec<_>>();
+    let ttl = params
+        .get("ttl_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(10);
+    let sleep_seconds = params
+        .get("sleep_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(10);
+    let (cpu, memory) = resource_limits(params)?;
+    let network_plan = resolve_network(params, gateways)?;
+    let unit =
+        safe_unit_name(box_id).ok_or_else(|| error("ERR_INVALID_REQUEST", "invalid box_id"))?;
+    if !unsupported.is_empty() {
+        return Err(error(
+            "FAIL_CLOSED",
+            format!(
+                "required capabilities are not enforceable: {}",
+                unsupported.join(", ")
+            ),
+        ));
+    }
+    if ttl == 0 || ttl > 86400 {
+        return Err(error(
+            "ERR_INVALID_REQUEST",
+            "ttl_seconds must be between 1 and 86400",
+        ));
+    }
+    if sleep_seconds == 0 || sleep_seconds > 300 {
+        return Err(error(
+            "ERR_INVALID_REQUEST",
+            "sleep_seconds must be between 1 and 300",
+        ));
+    }
+    if states.lock().expect("state lock").contains_key(box_id) {
+        return Err(error("ERR_DUPLICATE_BOX", "box already exists"));
+    }
+    if !command_available("systemd-run") || !command_available("systemctl") {
+        return Err(error(
+            "ERR_CAPABILITY_UNAVAILABLE",
+            "systemd-run and systemctl are required for full lifecycle enforcement",
+        ));
+    }
+    let scratch = filesystem_policy(params, &unit)?;
+    start_unit(
+        &unit,
+        ttl,
+        sleep_seconds,
+        cpu,
+        memory,
+        &scratch,
+        &network_plan.gateway_sockets,
+    )?;
+    states.lock().expect("state lock").insert(
+        box_id.into(),
+        UnitState {
+            unit: unit.clone(),
+            status: "STARTING".into(),
+            scratch_path: scratch.clone(),
+            cpu_quota_percent: cpu,
+            memory_limit_bytes: memory,
+        },
+    );
+    let watchdog_states = Arc::clone(states);
+    let watchdog_gateways = gateways.clone();
+    let watchdog_admissions = Arc::clone(admissions);
+    let watchdog_box = box_id.to_owned();
+    let watchdog_unit = unit.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(ttl.saturating_add(2)));
+        let timed_out = watchdog_states
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .get(&watchdog_box)
+                    .map(|value| value.status == "STARTING" || value.status == "active")
+            })
+            .unwrap_or(false);
+        if timed_out {
+            let _ = Command::new("systemctl")
+                .args(["--user", "stop", &watchdog_unit])
+                .output();
+            if let Ok(mut state) = watchdog_states.lock() {
+                if let Some(value) = state.get_mut(&watchdog_box) {
+                    value.status = "TIMED_OUT".into();
+                }
+            }
+            if watchdog_admissions
+                .lock()
+                .expect("admission lock")
+                .controller
+                .release(&watchdog_box)
+            {
+                let _ = drain_queue(&watchdog_states, &watchdog_gateways, &watchdog_admissions);
+            }
+        }
+    });
+    let gateway_refs: Vec<&str> = network_plan
+        .gateway_sockets
+        .iter()
+        .map(|(gateway_ref, _)| gateway_ref.as_str())
+        .collect();
+    Ok(
+        json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"STARTING","ttl_seconds":ttl,"cpu_quota_percent":cpu,"memory_limit_bytes":memory,"filesystem_mode":"STRICT","scratch_path":scratch,"network_mode":network_plan.mode,"gateway_refs":gateway_refs,"private_network":true}),
+    )
+}
+
+fn queueable_spawn(
+    params: &Value,
+    states: &States,
+    gateways: &GatewayRegistry,
+) -> Result<(String, String), IpcErrorBody> {
+    let box_id = params.get("box_id").and_then(Value::as_str).unwrap_or("");
+    let unit =
+        safe_unit_name(box_id).ok_or_else(|| error("ERR_INVALID_REQUEST", "invalid box_id"))?;
+    if states.lock().expect("state lock").contains_key(box_id) {
+        return Err(error("ERR_DUPLICATE_BOX", "box already exists"));
+    }
+    let ttl = params
+        .get("ttl_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(10);
+    let sleep = params
+        .get("sleep_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(10);
+    if ttl == 0 || ttl > 86400 || sleep == 0 || sleep > 300 {
+        return Err(error(
+            "ERR_INVALID_REQUEST",
+            "invalid TTL or runner duration",
+        ));
+    }
+    resource_limits(params)?;
+    resolve_network(params, gateways)?;
+    if params.get("filesystem_mode").and_then(Value::as_str) != Some("STRICT")
+        || params.get("write_target").and_then(Value::as_str) != Some("scratch")
+    {
+        return Err(error(
+            "ERR_MOUNT_SETUP",
+            "filesystem must be STRICT with scratch output",
+        ));
+    }
+    Ok((box_id.to_owned(), unit))
+}
+
+fn admit_spawn(
+    params: &Value,
+    states: &States,
+    gateways: &GatewayRegistry,
+    admissions: &Admissions,
+) -> Result<Value, IpcErrorBody> {
+    let (box_id, unit) = queueable_spawn(params, states, gateways)?;
+    let decision = admissions
+        .lock()
+        .expect("admission lock")
+        .controller
+        .admit(&box_id)
+        .map_err(|message| error("ERR_DUPLICATE_BOX", message))?;
+    match decision {
+        AdmissionDecision::Start => match spawn_box(params, states, gateways, admissions) {
+            Ok(result) => Ok(result),
+            Err(start_error) => {
+                admissions
+                    .lock()
+                    .expect("admission lock")
+                    .controller
+                    .release(&box_id);
+                Err(start_error)
+            }
+        },
+        AdmissionDecision::Queued { position } => {
+            let mut admission = admissions.lock().expect("admission lock");
+            admission.pending.insert(box_id.clone(), params.clone());
+            drop(admission);
+            states.lock().expect("state lock").insert(
+                box_id.clone(),
+                UnitState {
+                    unit: unit.clone(),
+                    status: "QUEUED".into(),
+                    scratch_path: String::new(),
+                    cpu_quota_percent: 0,
+                    memory_limit_bytes: 0,
+                },
+            );
+            Ok(
+                json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"QUEUED","queue_position":position}),
+            )
+        }
+    }
+}
+
+fn drain_queue(states: &States, gateways: &GatewayRegistry, admissions: &Admissions) -> Vec<Value> {
+    let mut started = Vec::new();
+    loop {
+        let next = admissions
+            .lock()
+            .expect("admission lock")
+            .controller
+            .start_next();
+        let Some(box_id) = next else { break };
+        let params = admissions
+            .lock()
+            .expect("admission lock")
+            .pending
+            .remove(&box_id);
+        let Some(params) = params else { continue };
+        states.lock().expect("state lock").remove(&box_id);
+        match spawn_box(&params, states, gateways, admissions) {
+            Ok(result) => started.push(result),
+            Err(error_value) => {
+                admissions
+                    .lock()
+                    .expect("admission lock")
+                    .controller
+                    .release(&box_id);
+                started.push(json!({"box_id":box_id,"status":"REJECTED_FROM_QUEUE","error":{"code":error_value.code,"message":error_value.message}}));
+            }
+        }
+    }
+    started
+}
+
+fn runtime_metrics(states: &States, admissions: &Admissions) -> Metrics {
+    let state = states.lock().expect("state lock");
+    let admission = admissions.lock().expect("admission lock");
+    let mut metrics = Metrics {
+        active_boxes: admission.controller.active_count() as u64,
+        queued_boxes: admission.controller.queued_count() as u64,
+        ..Metrics::default()
+    };
+    for value in state.values().filter(|value| {
+        value.status != "QUEUED" && value.status != "KILLED" && value.status != "TIMED_OUT"
+    }) {
+        metrics.cpu_quota_percent += value.cpu_quota_percent;
+        metrics.memory_limit_bytes += value.memory_limit_bytes;
+    }
+    metrics
+}
+
+fn handle(
+    request: Request,
+    states: &States,
+    gateways: &GatewayRegistry,
+    admissions: &Admissions,
+) -> Response {
     if request.version != IPC_VERSION {
         return response(
             request.request_id,
@@ -407,134 +925,25 @@ fn handle(request: Request, states: &States, gateways: &GatewayRegistry) -> Resp
     let id = request.request_id;
     let result = match request.method.as_str() {
         "capabilities" => Ok(
-            json!({"schema":"viper-boxd.capabilities.v0","probe_mode":"READ_ONLY","backend_ready":command_available("systemd-run") && command_available("systemctl"),"backend":"systemd-user","supported_operations":["spawn","status","kill","cleanup","filesystem_probe","network_probe","gateway_probe"]}),
+            json!({"schema":"viper-boxd.capabilities.v0","probe_mode":"READ_ONLY","backend_ready":command_available("systemd-run") && command_available("systemctl"),"backend":"systemd-user","supported_operations":["spawn","status","kill","cleanup","admission/status","admission/drain","metrics","filesystem_probe","network_probe","gateway_probe","signal_probe","resource_probe"]}),
         ),
-        "spawn" => {
-            let box_id = request
-                .params
-                .get("box_id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let unsupported = request
-                .params
-                .get("required_backend")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flat_map(|v| v.iter())
-                .filter_map(Value::as_str)
-                .filter(|r| *r != "systemd" && *r != "systemd_run")
-                .collect::<Vec<_>>();
-            let ttl = request
-                .params
-                .get("ttl_seconds")
-                .and_then(Value::as_u64)
-                .unwrap_or(10);
-            let sleep_seconds = request
-                .params
-                .get("sleep_seconds")
-                .and_then(Value::as_u64)
-                .unwrap_or(10);
-            let limits = match resource_limits(&request.params) {
-                Ok(limits) => limits,
-                Err(limit_error) => return response(id, Err(limit_error)),
-            };
-            let network_plan = match resolve_network(&request.params, gateways) {
-                Ok(plan) => plan,
-                Err(network_error) => return response(id, Err(network_error)),
-            };
-            match safe_unit_name(box_id) {
-                None => Err(error("ERR_INVALID_REQUEST", "invalid box_id")),
-                Some(_) if !unsupported.is_empty() => Err(error(
-                    "FAIL_CLOSED",
-                    format!(
-                        "required capabilities are not enforceable: {}",
-                        unsupported.join(", ")
-                    ),
-                )),
-                Some(_) if ttl == 0 || ttl > 86400 => Err(error(
-                    "ERR_INVALID_REQUEST",
-                    "ttl_seconds must be between 1 and 86400",
-                )),
-                Some(_) if sleep_seconds == 0 || sleep_seconds > 300 => Err(error(
-                    "ERR_INVALID_REQUEST",
-                    "sleep_seconds must be between 1 and 300",
-                )),
-                Some(_) if states.lock().expect("state lock").contains_key(box_id) => {
-                    Err(error("ERR_DUPLICATE_BOX", "box already exists"))
-                }
-                // status/kill/cleanup and the spawn watchdog all shell out
-                // to systemctl directly, unconditionally - a Box must not
-                // be allowed to start unless the full lifecycle, not just
-                // the initial spawn, can be enforced.
-                Some(_unit) if !command_available("systemd-run") => Err(error(
-                    "ERR_CAPABILITY_UNAVAILABLE",
-                    "systemd-run is not available",
-                )),
-                Some(_unit) if !command_available("systemctl") => Err(error(
-                    "ERR_CAPABILITY_UNAVAILABLE",
-                    "systemctl is not available",
-                )),
-                Some(unit) => {
-                    let (cpu, memory) = limits;
-                    let scratch = match filesystem_policy(&request.params, &unit) {
-                        Ok(path) => path,
-                        Err(e) => return response(id, Err(e)),
-                    };
-                    match start_unit(
-                        &unit,
-                        ttl,
-                        sleep_seconds,
-                        cpu,
-                        memory,
-                        &scratch,
-                        &network_plan.gateway_sockets,
-                    ) {
-                        Err(e) => Err(e),
-                        Ok(()) => {
-                            states.lock().expect("state lock").insert(
-                                box_id.into(),
-                                UnitState {
-                                    unit: unit.clone(),
-                                    status: "STARTING".into(),
-                                    scratch_path: scratch.clone(),
-                                },
-                            );
-                            let watchdog_states = Arc::clone(states);
-                            let watchdog_box = box_id.to_owned();
-                            let watchdog_unit = unit.clone();
-                            thread::spawn(move || {
-                                thread::sleep(Duration::from_secs(ttl.saturating_add(2)));
-                                let timed_out = watchdog_states
-                                    .lock()
-                                    .ok()
-                                    .and_then(|s| {
-                                        s.get(&watchdog_box)
-                                            .map(|v| v.status == "STARTING" || v.status == "active")
-                                    })
-                                    .unwrap_or(false);
-                                if timed_out {
-                                    let _ = Command::new("systemctl")
-                                        .args(["--user", "stop", &watchdog_unit])
-                                        .output();
-                                    if let Ok(mut s) = watchdog_states.lock() {
-                                        if let Some(v) = s.get_mut(&watchdog_box) {
-                                            v.status = "TIMED_OUT".into();
-                                        }
-                                    }
-                                }
-                            });
-                            let gateway_refs: Vec<&str> = network_plan
-                                .gateway_sockets
-                                .iter()
-                                .map(|(gateway_ref, _)| gateway_ref.as_str())
-                                .collect();
-                            Ok(
-                                json!({"box_id":box_id,"unit":unit,"handle":format!("systemd:{unit}"),"status":"STARTING","ttl_seconds":ttl,"cpu_quota_percent":cpu,"memory_limit_bytes":memory,"filesystem_mode":"STRICT","scratch_path":scratch,"network_mode":network_plan.mode,"gateway_refs":gateway_refs,"private_network":true}),
-                            )
-                        }
-                    }
-                }
-            }
+        "spawn" => admit_spawn(&request.params, states, gateways, admissions),
+        "admission/status" => {
+            let admission = admissions.lock().expect("admission lock");
+            Ok(json!({
+                "schema":"viper-boxd.admission.v0",
+                "max_active_boxes": admission.controller.limit(),
+                "active_boxes": admission.controller.active_count(),
+                "queued_boxes": admission.controller.queued_count(),
+            }))
+        }
+        "admission/drain" => Ok(json!({
+            "status":"DRAINED",
+            "started":drain_queue(states, gateways, admissions),
+        })),
+        "metrics" => {
+            let metrics = runtime_metrics(states, admissions);
+            Ok(json!({"schema":"viper-boxd.metrics.v0","prometheus":metrics.prometheus()}))
         }
         "filesystem_probe" => {
             let runtime =
@@ -602,6 +1011,22 @@ fn handle(request: Request, states: &States, gateways: &GatewayRegistry) -> Resp
                 }
             }
         }
+        "signal_probe" => run_signal_probe().map(|probe| {
+            json!({
+                "status": "PROBE_COMPLETED",
+                "probe": probe,
+                "side_effects": true,
+            })
+        }),
+        "resource_probe" => run_resource_probe().map(|probe| {
+            json!({
+                "status": "PROBE_COMPLETED",
+                "probe": probe,
+                "cpu_quota_percent": RESOURCE_PROBE_CPU_QUOTA_PERCENT,
+                "memory_limit_bytes": RESOURCE_PROBE_MEMORY_LIMIT_BYTES,
+                "side_effects": true,
+            })
+        }),
         "status" | "kill" | "cleanup" => {
             let handle = request
                 .params
@@ -614,6 +1039,63 @@ fn handle(request: Request, states: &States, gateways: &GatewayRegistry) -> Resp
                 .ok_or_else(|| error("ERR_HANDLE_UNKNOWN", "unknown systemd handle"));
             match (request.method.as_str(), unit) {
                 (_, Err(e)) => Err(e),
+                ("status", Ok(unit))
+                    if states
+                        .lock()
+                        .ok()
+                        .and_then(|s| {
+                            s.values()
+                                .find(|v| v.unit == unit)
+                                .map(|v| v.status == "QUEUED")
+                        })
+                        .unwrap_or(false) =>
+                {
+                    Ok(json!({"handle":handle,"unit":unit,"status":"QUEUED"}))
+                }
+                ("kill" | "cleanup", Ok(unit))
+                    if states
+                        .lock()
+                        .ok()
+                        .and_then(|s| {
+                            s.iter().find_map(|(box_id, value)| {
+                                (value.unit == unit && value.status == "QUEUED")
+                                    .then(|| box_id.clone())
+                            })
+                        })
+                        .is_some() =>
+                {
+                    let box_id = states
+                        .lock()
+                        .expect("state lock")
+                        .iter()
+                        .find_map(|(box_id, value)| {
+                            (value.unit == unit && value.status == "QUEUED").then(|| box_id.clone())
+                        })
+                        .expect("queued state was checked above");
+                    let cancelled = admissions
+                        .lock()
+                        .expect("admission lock")
+                        .controller
+                        .cancel_queued(&box_id);
+                    admissions
+                        .lock()
+                        .expect("admission lock")
+                        .pending
+                        .remove(&box_id);
+                    states.lock().expect("state lock").remove(&box_id);
+                    Ok(
+                        json!({"handle":handle,"unit":unit,"status":"CANCELLED","box_id":box_id,"cancelled":cancelled}),
+                    )
+                }
+                (_, Ok(unit))
+                    if !states
+                        .lock()
+                        .ok()
+                        .map(|s| s.values().any(|value| value.unit == unit))
+                        .unwrap_or(false) =>
+                {
+                    Err(error("ERR_HANDLE_UNKNOWN", "unknown systemd handle"))
+                }
                 ("status", Ok(unit)) => {
                     if states
                         .lock()
@@ -646,12 +1128,28 @@ fn handle(request: Request, states: &States, gateways: &GatewayRegistry) -> Resp
                     .output()
                 {
                     Ok(o) if o.status.success() => {
+                        let box_id = states.lock().ok().and_then(|s| {
+                            s.iter().find_map(|(box_id, value)| {
+                                (value.unit == unit).then(|| box_id.clone())
+                            })
+                        });
                         if let Ok(mut s) = states.lock() {
                             if let Some(v) = s.values_mut().find(|v| v.unit == unit) {
                                 v.status = "KILLED".into();
                             }
                         }
-                        Ok(json!({"handle":handle,"unit":unit,"status":"KILLED"}))
+                        let started = box_id
+                            .as_deref()
+                            .filter(|box_id| {
+                                admissions
+                                    .lock()
+                                    .expect("admission lock")
+                                    .controller
+                                    .release(box_id)
+                            })
+                            .map(|_| drain_queue(states, gateways, admissions))
+                            .unwrap_or_default();
+                        Ok(json!({"handle":handle,"unit":unit,"status":"KILLED","started":started}))
                     }
                     Ok(o) => Err(command_error(o, "systemctl stop", "ERR_KILL_FAILED")),
                     Err(e) => Err(error("ERR_KILL_FAILED", e.to_string())),
@@ -682,7 +1180,10 @@ fn handle(request: Request, states: &States, gateways: &GatewayRegistry) -> Resp
                             if let Ok(mut s) = states.lock() {
                                 s.retain(|_, v| v.unit != unit);
                             }
-                            Ok(json!({"handle":handle,"unit":unit,"status":"CLEANED"}))
+                            let started = drain_queue(states, gateways, admissions);
+                            Ok(
+                                json!({"handle":handle,"unit":unit,"status":"CLEANED","started":started}),
+                            )
                         }
                         Ok(o) => Err(command_error(
                             o,
@@ -699,18 +1200,47 @@ fn handle(request: Request, states: &States, gateways: &GatewayRegistry) -> Resp
     };
     response(id, result)
 }
-fn serve(mut stream: UnixStream, states: &States, gateways: &GatewayRegistry) -> std::io::Result<()> {
+fn serve(
+    mut stream: UnixStream,
+    states: &States,
+    gateways: &GatewayRegistry,
+    admissions: &Admissions,
+) -> std::io::Result<()> {
     let mut line = String::new();
+    let started_at = Instant::now();
     BufReader::new(stream.try_clone()?)
         .take(viper_boxd::ipc::MAX_LINE_BYTES)
         .read_line(&mut line)?;
-    let reply = match serde_json::from_str::<Request>(&line) {
-        Ok(req) => handle(req, states, gateways),
-        Err(e) => response(
-            "unknown".into(),
-            Err(error("ERR_INVALID_REQUEST", e.to_string())),
+    let (reply, method) = match serde_json::from_str::<Request>(&line) {
+        Ok(req) => {
+            let method = req.method.clone();
+            (handle(req, states, gateways, admissions), method)
+        }
+        Err(e) => (
+            response(
+                "unknown".into(),
+                Err(error("ERR_INVALID_REQUEST", e.to_string())),
+            ),
+            "invalid".into(),
         ),
     };
+    if let Some(path) = env::var_os("VIPER_AUDIT_LOG") {
+        let fields = json!({
+            "request_id": reply.request_id,
+            "method": method,
+            "ok": reply.ok,
+            "audit_trace_id": reply.audit_trace_id,
+            "error_code": reply.error.as_ref().map(|value| value.code.as_str()),
+        });
+        if let Err(error) = append_jsonl(
+            std::path::Path::new(&path),
+            "helper_ipc",
+            &fields,
+            started_at.elapsed().as_millis(),
+        ) {
+            eprintln!("viper-helper: audit JSONL write failed: {error}");
+        }
+    }
     serde_json::to_writer(&mut stream, &reply).map_err(std::io::Error::other)?;
     stream.write_all(b"\n")?;
     stream.flush()
@@ -723,16 +1253,36 @@ fn main() -> std::io::Result<()> {
         .nth(2)
         .unwrap_or_else(|| "examples/gateway-registry.toml".into());
     let gateways = load_gateway_registry(&registry_path).map_err(std::io::Error::other)?;
+    let lineage_dir = env::var_os("VIPER_LINEAGE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/var/lib/viper-boxd/lineage".into());
+    if lineage_dir.exists() {
+        let reconciled = reconcile_orphaned_boxes(&lineage_dir).map_err(std::io::Error::other)?;
+        eprintln!("viper-helper: startup reconciliation completed ({reconciled} orphaned Boxes)");
+    } else {
+        eprintln!(
+            "viper-helper: lineage directory {} is absent; startup reconciliation skipped",
+            lineage_dir.display()
+        );
+    }
     let listener = viper_boxd::ipc::bind_unix_socket(&socket)?;
     eprintln!("viper-helper listening on {socket}");
     let states: States = Arc::new(Mutex::new(BTreeMap::new()));
+    let limit = env::var("VIPER_MAX_ACTIVE_BOXES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(50);
+    let admissions: Admissions = Arc::new(Mutex::new(AdmissionState {
+        controller: AdmissionController::new(limit).map_err(std::io::Error::other)?,
+        pending: BTreeMap::new(),
+    }));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 if viper_boxd::ipc::configure_server_stream(&stream).is_err() {
                     continue;
                 }
-                if let Err(e) = serve(stream, &states, &gateways) {
+                if let Err(e) = serve(stream, &states, &gateways, &admissions) {
                     eprintln!("helper connection error: {e}");
                 }
             }
@@ -744,9 +1294,22 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{filesystem_policy, resolve_network, resource_limits, GatewayRegistry};
+    use super::{
+        enforceable_backend_requirement, filesystem_policy, handle, probe_unit_name,
+        resolve_network, resource_limits, safe_unit_name, AdmissionState, Admissions,
+        GatewayRegistry, States,
+    };
     use serde_json::json;
+    use serde_json::Value;
     use std::os::unix::net::UnixListener;
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
+    use viper_boxd::{
+        admission::AdmissionController,
+        ipc::{Request, IPC_VERSION},
+    };
 
     #[test]
     fn accepts_valid_cpu_and_memory_limits() {
@@ -766,6 +1329,41 @@ mod tests {
     }
 
     #[test]
+    fn rejects_overlong_or_control_character_box_ids() {
+        assert!(safe_unit_name(&"A".repeat(49)).is_none());
+        assert!(safe_unit_name("BOX\nEVIL").is_none());
+        assert!(safe_unit_name("BOX\0EVIL").is_none());
+        assert!(safe_unit_name("BOX\tEVIL").is_none());
+        assert!(safe_unit_name("BOX_OK-123").is_some());
+    }
+
+    #[test]
+    fn accepts_only_declared_backend_capabilities() {
+        for requirement in [
+            "systemd",
+            "systemd_run",
+            "mount_namespace",
+            "network_policy",
+            "cgroup_limits",
+        ] {
+            assert!(
+                enforceable_backend_requirement(requirement),
+                "{requirement}"
+            );
+        }
+        assert!(!enforceable_backend_requirement("arbitrary_command"));
+        assert!(!enforceable_backend_requirement("host_network"));
+    }
+
+    #[test]
+    fn probe_unit_names_do_not_collide_in_one_helper_process() {
+        assert_ne!(
+            probe_unit_name("resource-probe"),
+            probe_unit_name("resource-probe")
+        );
+    }
+
+    #[test]
     fn rejects_zero_or_excessive_memory() {
         assert!(
             resource_limits(&json!({"cpu_quota_percent": 50, "memory_limit_bytes": 0})).is_err()
@@ -774,6 +1372,20 @@ mod tests {
             &json!({"cpu_quota_percent": 50, "memory_limit_bytes": 1u64 << 51})
         )
         .is_err());
+    }
+
+    #[test]
+    fn rejects_attempts_to_raise_or_disable_resource_limits() {
+        assert!(
+            resource_limits(&json!({"cpu_quota_percent": 0, "memory_limit_bytes": 536870912}))
+                .is_err()
+        );
+        assert!(resource_limits(
+            &json!({"cpu_quota_percent": 10_000, "memory_limit_bytes": 536870912})
+        )
+        .is_err());
+        assert!(resource_limits(&json!({"memory_limit_bytes": 536870912})).is_err());
+        assert!(resource_limits(&json!({"cpu_quota_percent": 50})).is_err());
     }
 
     #[test]
@@ -853,8 +1465,38 @@ mod tests {
         )
         .expect("live socket resolves");
         assert_eq!(plan.mode, "GATEWAY_ONLY");
-        assert_eq!(plan.gateway_sockets, vec![("LIVE".to_owned(), path.to_str().unwrap().to_owned())]);
+        assert_eq!(
+            plan.gateway_sockets,
+            vec![("LIVE".to_owned(), path.to_str().unwrap().to_owned())]
+        );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn request(method: &str, params: Value) -> Request {
+        Request {
+            version: IPC_VERSION.into(),
+            request_id: "test".into(),
+            method: method.into(),
+            params,
+        }
+    }
+
+    #[test]
+    fn rejects_forged_systemd_handles_before_calling_systemctl() {
+        let states: States = Arc::new(Mutex::new(BTreeMap::new()));
+        let gateways = GatewayRegistry::new();
+        let admissions: Admissions = Arc::new(Mutex::new(AdmissionState {
+            controller: AdmissionController::new(50).unwrap(),
+            pending: BTreeMap::new(),
+        }));
+        let response = handle(
+            request("kill", json!({"handle": "systemd:dbus.service"})),
+            &states,
+            &gateways,
+            &admissions,
+        );
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().code, "ERR_HANDLE_UNKNOWN");
     }
 }

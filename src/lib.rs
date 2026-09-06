@@ -1,6 +1,9 @@
+pub mod admission;
 pub mod capabilities;
 pub mod ipc;
+pub mod lineage;
 pub mod model_provider;
+pub mod observability;
 pub mod research_fetcher;
 pub mod research_policy;
 pub mod search_provider;
