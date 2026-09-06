@@ -13,6 +13,17 @@
 > any real agent execution. Feedback, issues, and bug reports are welcome
 > via GitHub Issues; see [Contact](#contact) for direct contact.
 
+## Status
+
+- **Project:** `viper-boxd`
+- **Version:** `0.1.0-alpha.1`
+- **Stability:** alpha / experimental
+- **Execution scope:** controlled systemd test runner only; no arbitrary agent
+  command execution
+- **Security status:** automated boundary probes and local verification only;
+  no independent audit
+- **Repository visibility:** private during alpha development
+
 ## Purpose
 
 JFP Box validates whether an agent task manifest is internally consistent. It
@@ -49,13 +60,22 @@ intended use and the organization deploying it.
 - no claim of kernel-level security until an implementation is independently
   reviewed and tested.
 
-## Relationship to JFP Box
+## Relationship to other projects
 
-`viper-boxd` must treat the JFP validator as a mandatory policy gate, but a
-`PLAN_ACCEPTED` result is necessary—not sufficient—for safe execution. The
-daemon owns the mapping from logical `workspace_id` and `profile_id` to trusted
-host configuration. Agents never provide host paths, capabilities, ports, or
-backend arguments.
+`viper-boxd` is the runtime-enforcement layer in the JFP ecosystem.
+
+- `jfp-box` is the mandatory policy gate. `viper-boxd` must treat
+  `PLAN_ACCEPTED` as necessary but not sufficient for safe execution.
+- `viper-boxd` owns the trusted mapping from logical `workspace_id`,
+  `profile_id`, gateway references, and resource limits to host configuration.
+  Agents never provide host paths, capabilities, ports, or backend arguments.
+- `jfp-box-agent` is an ACP-facing adapter that calls JFP Box first and then
+  calls `viper-boxd` only for accepted plans. AionUi or another ACP client sees
+  the adapter; `viper-boxd` remains an internal runtime/backend component.
+
+This repository is not a replacement for `jfp-box`: it depends on the validator
+contract and focuses on enforcement, lifecycle control, gateway mediation,
+lineage, admission control, metrics, and audit output.
 
 ## Simulator quick start
 
@@ -454,17 +474,17 @@ immediate failure.
 
 ## Backend decision
 
-The planned first real backend is a separate `viper-helper` system service
-using systemd lifecycle, cgroups, and namespace controls. The decision and
-profile mapping are documented in [BACKEND_DECISION.md](BACKEND_DECISION.md).
-No privileged runner has been implemented yet.
+The first real backend path is the separate `viper-helper` systemd-user helper
+using systemd lifecycle, cgroups, and namespace controls for fixed controlled
+test units. The decision and profile mapping are documented in
+[BACKEND_DECISION.md](BACKEND_DECISION.md).
 
-## Status
+## Additional references
 
-Working unprivileged simulator, source-available, alpha. See [ARCHITECTURE.md](ARCHITECTURE.md),
-[THREAT_MODEL.md](THREAT_MODEL.md), [ROADMAP.md](ROADMAP.md),
-[PROJECT_PLAN.md](PROJECT_PLAN.md), and [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)
-for trade-offs confirmed real but deliberately left unfixed at this stage.
+See [ARCHITECTURE.md](ARCHITECTURE.md), [THREAT_MODEL.md](THREAT_MODEL.md),
+[ROADMAP.md](ROADMAP.md), [PROJECT_PLAN.md](PROJECT_PLAN.md), and
+[KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for trade-offs confirmed real but
+deliberately left unfixed at this alpha stage.
 
 ## Contact
 
