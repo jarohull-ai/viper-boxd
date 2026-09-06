@@ -1,0 +1,68 @@
+name: Phase 3 security boundaries
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  escape-probes:
+    name: filesystem, network, signal and resource escape probes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build helper and probes
+        run: cargo build --locked --bins
+
+      - name: Require a usable systemd user manager
+        run: |
+          set -euo pipefail
+          systemctl --user show-environment >/dev/null
+          command -v systemd-run >/dev/null
+          command -v systemctl >/dev/null
+
+      - name: Run real escape probes
+        run: |
+          set -euo pipefail
+          run_dir="$(mktemp -d)"
+          socket="$run_dir/viper-helper.sock"
+          log="$run_dir/audit.jsonl"
+          cleanup() {
+            if [[ -n "${helper_pid:-}" ]]; then
+              kill "$helper_pid" 2>/dev/null || true
+              wait "$helper_pid" 2>/dev/null || true
+            fi
+            rm -rf "$run_dir"
+          }
+          trap cleanup EXIT
+
+          VIPER_AUDIT_LOG="$log" ./target/debug/viper-helper "$socket" &
+          helper_pid=$!
+          for _ in $(seq 1 50); do
+            [[ -S "$socket" ]] && break
+            sleep 0.1
+          done
+          [[ -S "$socket" ]]
+
+          ./target/debug/viper-boxd filesystem-probe --socket "$socket"
+          ./target/debug/viper-boxd network-probe --socket "$socket"
+          ./target/debug/viper-boxd signal-probe --socket "$socket"
+          ./target/debug/viper-boxd resource-probe --socket "$socket"
+
+          test -s "$log"
+          grep -Eq '"timestamp":"[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z"' "$log"
+          grep -Eq '"duration_ms":[0-9]+' "$log"
+
+      - name: Run nightly DoS regressions
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: cargo test --locked --test dos_heavy -- --ignored --test-threads=1
