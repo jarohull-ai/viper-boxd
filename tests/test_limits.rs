@@ -29,7 +29,10 @@ fn nonce() -> u128 {
 }
 
 fn temp_path(name: &str, extension: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("viper-boxd-test-limits-{name}-{}.{extension}", nonce()))
+    std::env::temp_dir().join(format!(
+        "viper-boxd-test-limits-{name}-{}.{extension}",
+        nonce()
+    ))
 }
 
 fn write_config(name: &str, max_requests: u32, timeout_seconds: u64, max_redirects: u8) -> PathBuf {
@@ -89,13 +92,19 @@ fn max_requests_budget_is_enforced_across_the_socket() {
     wait_for_socket(&socket);
     let socket_str = socket.to_str().expect("UTF-8 socket path");
 
-    let first = send_request(socket_str, &fetch_request("r1", "https://not-allowed.invalid"))
-        .expect("first request round-trips");
+    let first = send_request(
+        socket_str,
+        &fetch_request("r1", "https://not-allowed.invalid"),
+    )
+    .expect("first request round-trips");
     assert!(!first.ok);
     assert_ne!(first.error.unwrap().code, "ERR_REQUEST_LIMIT_EXCEEDED");
 
-    let second = send_request(socket_str, &fetch_request("r2", "https://not-allowed.invalid"))
-        .expect("second request round-trips");
+    let second = send_request(
+        socket_str,
+        &fetch_request("r2", "https://not-allowed.invalid"),
+    )
+    .expect("second request round-trips");
     assert!(!second.ok);
     assert_eq!(second.error.unwrap().code, "ERR_REQUEST_LIMIT_EXCEEDED");
 

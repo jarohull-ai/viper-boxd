@@ -143,7 +143,12 @@ mod tests {
     struct CannedTransport(Result<Vec<u8>, PolicyViolation>);
 
     impl SearchTransport for CannedTransport {
-        fn search(&self, _api_key: &str, _query: &str, _count: u8) -> Result<Vec<u8>, PolicyViolation> {
+        fn search(
+            &self,
+            _api_key: &str,
+            _query: &str,
+            _count: u8,
+        ) -> Result<Vec<u8>, PolicyViolation> {
             match &self.0 {
                 Ok(body) => Ok(body.clone()),
                 Err(e) => Err(e.clone()),

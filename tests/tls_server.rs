@@ -254,8 +254,9 @@ fn tls_connection_without_trusted_root_is_rejected() {
         .build()
         .expect("build client with only built-in trust roots");
     let target = format!("https://127.0.0.1:{}/ok", server.address.port());
-    let error = client.get(target).send().expect_err(
-        "a client without the test root must not complete the TLS handshake",
-    );
+    let error = client
+        .get(target)
+        .send()
+        .expect_err("a client without the test root must not complete the TLS handshake");
     assert!(error.is_connect() || error.is_request());
 }

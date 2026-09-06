@@ -146,7 +146,10 @@ impl ModelStreamTransport for OllamaStreamTransport {
                     .send()
                     .map_err(|e| e.to_string())?;
                 if !response.status().is_success() {
-                    return Err(format!("model provider returned HTTP {}", response.status()));
+                    return Err(format!(
+                        "model provider returned HTTP {}",
+                        response.status()
+                    ));
                 }
                 use std::io::BufRead;
                 for line in std::io::BufReader::new(response).lines() {
@@ -277,7 +280,10 @@ impl ModelStreamTransport for OpenAiCompatibleStreamTransport {
                     .send()
                     .map_err(|e| e.to_string())?;
                 if !response.status().is_success() {
-                    return Err(format!("model provider returned HTTP {}", response.status()));
+                    return Err(format!(
+                        "model provider returned HTTP {}",
+                        response.status()
+                    ));
                 }
                 use std::io::BufRead;
                 for line in std::io::BufReader::new(response).lines() {
@@ -314,13 +320,7 @@ impl ModelStreamTransport for OpenAiCompatibleStreamTransport {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_owned();
-                    if tx
-                        .send(Ok(SseDelta {
-                            delta,
-                            done: false,
-                        }))
-                        .is_err()
-                    {
+                    if tx.send(Ok(SseDelta { delta, done: false })).is_err() {
                         return Ok(()); // receiver gave up (idle timeout); stop reading
                     }
                 }
@@ -506,7 +506,10 @@ impl ModelStreamTransport for AnthropicStreamTransport {
                     .send()
                     .map_err(|e| e.to_string())?;
                 if !response.status().is_success() {
-                    return Err(format!("model provider returned HTTP {}", response.status()));
+                    return Err(format!(
+                        "model provider returned HTTP {}",
+                        response.status()
+                    ));
                 }
                 use std::io::BufRead;
                 for line in std::io::BufReader::new(response).lines() {
@@ -515,7 +518,8 @@ impl ModelStreamTransport for AnthropicStreamTransport {
                     let Some(data) = trimmed.strip_prefix("data:") else {
                         continue; // event: lines, blank separators, anything else
                     };
-                    let parsed: Value = serde_json::from_str(data.trim()).map_err(|e| e.to_string())?;
+                    let parsed: Value =
+                        serde_json::from_str(data.trim()).map_err(|e| e.to_string())?;
                     let event_type = parsed.get("type").and_then(Value::as_str).unwrap_or("");
                     match event_type {
                         "message_stop" => {
@@ -549,13 +553,7 @@ impl ModelStreamTransport for AnthropicStreamTransport {
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
                                 .to_owned();
-                            if tx
-                                .send(Ok(SseDelta {
-                                    delta,
-                                    done: false,
-                                }))
-                                .is_err()
-                            {
+                            if tx.send(Ok(SseDelta { delta, done: false })).is_err() {
                                 return Ok(()); // receiver gave up (idle timeout); stop reading
                             }
                         }
@@ -982,16 +980,16 @@ mod tests {
 
     #[test]
     fn rejects_empty_prompt_before_any_transport_call() {
-        let error = generate(&must_not_be_called(), "http://x", "m", "  ", 100, 128, 5)
-            .unwrap_err();
+        let error =
+            generate(&must_not_be_called(), "http://x", "m", "  ", 100, 128, 5).unwrap_err();
         assert_eq!(error.code, "ERR_MODEL_PROMPT_INVALID");
     }
 
     #[test]
     fn rejects_oversized_prompt_before_any_transport_call() {
         let prompt = "a".repeat(101);
-        let error = generate(&must_not_be_called(), "http://x", "m", &prompt, 100, 128, 5)
-            .unwrap_err();
+        let error =
+            generate(&must_not_be_called(), "http://x", "m", &prompt, 100, 128, 5).unwrap_err();
         assert_eq!(error.code, "ERR_MODEL_PROMPT_INVALID");
     }
 
@@ -1073,11 +1071,20 @@ mod tests {
 
         #[test]
         fn rejects_empty_prompt_before_any_transport_call() {
-            let error =
-                generate_stream(&must_not_be_called(), "http://x", "m", "  ", 100, 128, 5, 30, &mut |_, _| {
+            let error = generate_stream(
+                &must_not_be_called(),
+                "http://x",
+                "m",
+                "  ",
+                100,
+                128,
+                5,
+                30,
+                &mut |_, _| {
                     panic!("on_delta must not be called");
-                })
-                .unwrap_err();
+                },
+            )
+            .unwrap_err();
             assert_eq!(error.code, "ERR_MODEL_PROMPT_INVALID");
         }
 
@@ -1166,21 +1173,34 @@ mod tests {
 
         #[test]
         fn rejects_empty_prompt_before_any_transport_call() {
-            let error =
-                generate_openai_compatible(&must_not_be_called(), "http://x", "m", "  ", 100, 128, 5)
-                    .unwrap_err();
+            let error = generate_openai_compatible(
+                &must_not_be_called(),
+                "http://x",
+                "m",
+                "  ",
+                100,
+                128,
+                5,
+            )
+            .unwrap_err();
             assert_eq!(error.code, "ERR_MODEL_PROMPT_INVALID");
         }
 
         #[test]
         fn maps_a_canned_successful_response_to_the_documented_shape() {
-            let body =
-                br#"{"choices":[{"message":{"role":"assistant","content":"hello world"}}]}"#
-                    .to_vec();
+            let body = br#"{"choices":[{"message":{"role":"assistant","content":"hello world"}}]}"#
+                .to_vec();
             let transport = CannedTransport(Ok(body));
-            let response =
-                generate_openai_compatible(&transport, "http://x", "gpt-4o-mini", "hi", 1000, 128, 5)
-                    .expect("canned response parses");
+            let response = generate_openai_compatible(
+                &transport,
+                "http://x",
+                "gpt-4o-mini",
+                "hi",
+                1000,
+                128,
+                5,
+            )
+            .expect("canned response parses");
             assert_eq!(response.classification, "MODEL_OUTPUT");
             assert_eq!(response.model, "gpt-4o-mini");
             assert_eq!(response.text, "hello world");
@@ -1190,18 +1210,16 @@ mod tests {
         fn rejects_a_response_with_no_choices() {
             let body = br#"{"choices":[]}"#.to_vec();
             let transport = CannedTransport(Ok(body));
-            let error =
-                generate_openai_compatible(&transport, "http://x", "m", "hi", 1000, 128, 5)
-                    .unwrap_err();
+            let error = generate_openai_compatible(&transport, "http://x", "m", "hi", 1000, 128, 5)
+                .unwrap_err();
             assert_eq!(error.code, "ERR_MODEL_RESPONSE_INVALID");
         }
 
         #[test]
         fn rejects_malformed_json_from_the_provider() {
             let transport = CannedTransport(Ok(b"not json".to_vec()));
-            let error =
-                generate_openai_compatible(&transport, "http://x", "m", "hi", 1000, 128, 5)
-                    .unwrap_err();
+            let error = generate_openai_compatible(&transport, "http://x", "m", "hi", 1000, 128, 5)
+                .unwrap_err();
             assert_eq!(error.code, "ERR_MODEL_RESPONSE_INVALID");
         }
 
@@ -1211,9 +1229,8 @@ mod tests {
                 code: "ERR_MODEL_FAILED",
                 message: "invalid api key".into(),
             }));
-            let error =
-                generate_openai_compatible(&transport, "http://x", "m", "hi", 1000, 128, 5)
-                    .unwrap_err();
+            let error = generate_openai_compatible(&transport, "http://x", "m", "hi", 1000, 128, 5)
+                .unwrap_err();
             assert_eq!(error.code, "ERR_MODEL_FAILED");
         }
     }
@@ -1248,8 +1265,9 @@ mod tests {
 
         #[test]
         fn rejects_empty_prompt_before_any_transport_call() {
-            let error = generate_anthropic(&must_not_be_called(), "http://x", "m", "  ", 100, 128, 5)
-                .unwrap_err();
+            let error =
+                generate_anthropic(&must_not_be_called(), "http://x", "m", "  ", 100, 128, 5)
+                    .unwrap_err();
             assert_eq!(error.code, "ERR_MODEL_PROMPT_INVALID");
         }
 
@@ -1286,16 +1304,16 @@ mod tests {
         fn rejects_a_response_with_no_text_blocks() {
             let body = br#"{"content":[]}"#.to_vec();
             let transport = CannedTransport(Ok(body));
-            let error = generate_anthropic(&transport, "http://x", "m", "hi", 1000, 128, 5)
-                .unwrap_err();
+            let error =
+                generate_anthropic(&transport, "http://x", "m", "hi", 1000, 128, 5).unwrap_err();
             assert_eq!(error.code, "ERR_MODEL_RESPONSE_INVALID");
         }
 
         #[test]
         fn rejects_malformed_json_from_the_provider() {
             let transport = CannedTransport(Ok(b"not json".to_vec()));
-            let error = generate_anthropic(&transport, "http://x", "m", "hi", 1000, 128, 5)
-                .unwrap_err();
+            let error =
+                generate_anthropic(&transport, "http://x", "m", "hi", 1000, 128, 5).unwrap_err();
             assert_eq!(error.code, "ERR_MODEL_RESPONSE_INVALID");
         }
 
@@ -1305,8 +1323,8 @@ mod tests {
                 code: "ERR_MODEL_FAILED",
                 message: "invalid api key".into(),
             }));
-            let error = generate_anthropic(&transport, "http://x", "m", "hi", 1000, 128, 5)
-                .unwrap_err();
+            let error =
+                generate_anthropic(&transport, "http://x", "m", "hi", 1000, 128, 5).unwrap_err();
             assert_eq!(error.code, "ERR_MODEL_FAILED");
         }
     }
@@ -1347,8 +1365,7 @@ mod tests {
         #[test]
         fn rejects_oversized_input_before_any_transport_call() {
             let input = "a".repeat(101);
-            let error =
-                embed(&must_not_be_called(), "http://x", "m", &input, 100, 5).unwrap_err();
+            let error = embed(&must_not_be_called(), "http://x", "m", &input, 100, 5).unwrap_err();
             assert_eq!(error.code, "ERR_EMBED_INPUT_INVALID");
         }
 
@@ -1427,8 +1444,9 @@ mod tests {
 
         #[test]
         fn rejects_empty_input_before_any_transport_call() {
-            let error = embed_openai_compatible(&must_not_be_called(), "http://x", "m", "  ", 100, 5)
-                .unwrap_err();
+            let error =
+                embed_openai_compatible(&must_not_be_called(), "http://x", "m", "  ", 100, 5)
+                    .unwrap_err();
             assert_eq!(error.code, "ERR_EMBED_INPUT_INVALID");
         }
 
@@ -1455,16 +1473,16 @@ mod tests {
         fn rejects_a_response_with_no_data() {
             let body = br#"{"object":"list","data":[]}"#.to_vec();
             let transport = CannedEmbedTransport(Ok(body));
-            let error = embed_openai_compatible(&transport, "http://x", "m", "hi", 1000, 5)
-                .unwrap_err();
+            let error =
+                embed_openai_compatible(&transport, "http://x", "m", "hi", 1000, 5).unwrap_err();
             assert_eq!(error.code, "ERR_EMBED_RESPONSE_INVALID");
         }
 
         #[test]
         fn rejects_malformed_json_from_the_provider() {
             let transport = CannedEmbedTransport(Ok(b"not json".to_vec()));
-            let error = embed_openai_compatible(&transport, "http://x", "m", "hi", 1000, 5)
-                .unwrap_err();
+            let error =
+                embed_openai_compatible(&transport, "http://x", "m", "hi", 1000, 5).unwrap_err();
             assert_eq!(error.code, "ERR_EMBED_RESPONSE_INVALID");
         }
 
@@ -1474,8 +1492,8 @@ mod tests {
                 code: "ERR_EMBED_FAILED",
                 message: "invalid api key".into(),
             }));
-            let error = embed_openai_compatible(&transport, "http://x", "m", "hi", 1000, 5)
-                .unwrap_err();
+            let error =
+                embed_openai_compatible(&transport, "http://x", "m", "hi", 1000, 5).unwrap_err();
             assert_eq!(error.code, "ERR_EMBED_FAILED");
         }
     }

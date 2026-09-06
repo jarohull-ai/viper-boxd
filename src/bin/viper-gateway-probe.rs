@@ -20,7 +20,12 @@ fn network_blocked(address: &str) -> bool {
     .is_err()
 }
 
-fn call(socket: &str, request_id: &str, method: &str, params: Value) -> Option<viper_boxd::ipc::Response> {
+fn call(
+    socket: &str,
+    request_id: &str,
+    method: &str,
+    params: Value,
+) -> Option<viper_boxd::ipc::Response> {
     let request = Request {
         version: IPC_VERSION.into(),
         request_id: request_id.into(),

@@ -320,10 +320,15 @@ mod tests {
             "ERR_INVALID_REQUEST"
         );
         assert_eq!(
-            handle(request("SEARCH", json!({"query":"x"})), &policy, &budget, None)
-                .error
-                .unwrap()
-                .code,
+            handle(
+                request("SEARCH", json!({"query":"x"})),
+                &policy,
+                &budget,
+                None
+            )
+            .error
+            .unwrap()
+            .code,
             "ERR_NOT_IMPLEMENTED"
         );
     }
@@ -353,10 +358,20 @@ mod tests {
     fn search_also_consumes_the_shared_request_budget() {
         let policy = ResearchPolicy::mock();
         let budget = AtomicU32::new(1);
-        let first = handle(request("SEARCH", json!({"query":"x"})), &policy, &budget, None);
+        let first = handle(
+            request("SEARCH", json!({"query":"x"})),
+            &policy,
+            &budget,
+            None,
+        );
         assert!(!first.ok);
         assert_eq!(budget.load(std::sync::atomic::Ordering::Acquire), 0);
-        let second = handle(request("SEARCH", json!({"query":"x"})), &policy, &budget, None);
+        let second = handle(
+            request("SEARCH", json!({"query":"x"})),
+            &policy,
+            &budget,
+            None,
+        );
         assert_eq!(second.error.unwrap().code, "ERR_REQUEST_LIMIT_EXCEEDED");
     }
 

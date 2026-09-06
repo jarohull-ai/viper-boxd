@@ -73,10 +73,7 @@ impl GatewayConfig {
         }
         let requires_key = config.provider != "ollama";
         if requires_key && config.api_key_env.as_deref().unwrap_or("").is_empty() {
-            return Err(format!(
-                "provider {} requires api_key_env",
-                config.provider
-            ));
+            return Err(format!("provider {} requires api_key_env", config.provider));
         }
         // A keyed provider's API key must never cross the network in
         // plaintext. ollama stays unrestricted: it is expected to run on
@@ -164,7 +161,10 @@ fn handle(
                 .get("prompt")
                 .and_then(Value::as_str)
                 .ok_or_else(|| {
-                    error("ERR_INVALID_REQUEST", "MODEL_GENERATE requires params.prompt")
+                    error(
+                        "ERR_INVALID_REQUEST",
+                        "MODEL_GENERATE requires params.prompt",
+                    )
                 })
                 .and_then(|prompt| {
                     let outcome = match config.provider.as_str() {
@@ -304,7 +304,10 @@ fn serve_stream(
             0,
             String::new(),
             true,
-            Some(error("ERR_UNSUPPORTED_SCHEMA", "unsupported gateway version")),
+            Some(error(
+                "ERR_UNSUPPORTED_SCHEMA",
+                "unsupported gateway version",
+            )),
         );
         return write_stream_chunk(&mut stream, &chunk);
     }
@@ -499,7 +502,8 @@ mod tests {
     fn keyed_provider_with_a_plaintext_endpoint_is_rejected() {
         let path = "/tmp/viper-keyed-http-endpoint-model-gateway.toml";
         std::fs::write(path, "schema='viper-boxd.model-gateway.v0'\ngateway_id='x'\nprovider='openai'\nendpoint='http://api.openai.com/v1'\nmodel='gpt-4o-mini'\napi_key_env='X'\nmax_requests=1\nmax_prompt_chars=1\nmax_output_tokens=1\ntimeout_seconds=1\n").unwrap();
-        let error = GatewayConfig::load(path).expect_err("a plaintext endpoint for a keyed provider must be rejected");
+        let error = GatewayConfig::load(path)
+            .expect_err("a plaintext endpoint for a keyed provider must be rejected");
         assert!(error.contains("https://"));
         let _ = std::fs::remove_file(path);
     }
@@ -684,7 +688,12 @@ mod tests {
     #[test]
     fn rejects_missing_prompt() {
         let budget = AtomicU32::new(2);
-        let response = handle(request("MODEL_GENERATE", json!({})), &config(), &budget, None);
+        let response = handle(
+            request("MODEL_GENERATE", json!({})),
+            &config(),
+            &budget,
+            None,
+        );
         assert_eq!(response.error.unwrap().code, "ERR_INVALID_REQUEST");
     }
 

@@ -36,7 +36,12 @@ fn spawn_sse_server(body: String) -> (String, thread::JoinHandle<()>) {
     (format!("http://{addr}"), handle)
 }
 
-fn run(endpoint: &str) -> (Result<(), viper_boxd::research_policy::PolicyViolation>, Vec<(String, bool)>) {
+fn run(
+    endpoint: &str,
+) -> (
+    Result<(), viper_boxd::research_policy::PolicyViolation>,
+    Vec<(String, bool)>,
+) {
     let mut deltas = Vec::new();
     let result = generate_stream(
         &AnthropicStreamTransport {
@@ -92,7 +97,11 @@ fn delivers_text_deltas_and_stops_at_message_stop() {
     result.expect("stream completes");
     assert_eq!(
         deltas,
-        vec![("Hello".to_owned(), false), ("!".to_owned(), false), (String::new(), true)]
+        vec![
+            ("Hello".to_owned(), false),
+            ("!".to_owned(), false),
+            (String::new(), true)
+        ]
     );
 }
 
@@ -123,7 +132,10 @@ fn a_mid_stream_error_event_fails_the_call_without_a_done_chunk() {
     let error = result.expect_err("an error event must fail the stream");
     assert_eq!(error.code, "ERR_MODEL_FAILED");
     assert!(error.message.contains("Overloaded"));
-    assert!(deltas.is_empty(), "on_delta must not be called for an error event");
+    assert!(
+        deltas.is_empty(),
+        "on_delta must not be called for an error event"
+    );
 }
 
 #[test]

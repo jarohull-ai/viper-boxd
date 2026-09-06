@@ -40,7 +40,12 @@ fn spawn_sse_server(body: String) -> (String, thread::JoinHandle<()>) {
     (format!("http://{addr}"), handle)
 }
 
-fn run(endpoint: &str) -> (Result<(), viper_boxd::research_policy::PolicyViolation>, Vec<(String, bool)>) {
+fn run(
+    endpoint: &str,
+) -> (
+    Result<(), viper_boxd::research_policy::PolicyViolation>,
+    Vec<(String, bool)>,
+) {
     let mut deltas = Vec::new();
     let result = generate_stream(
         &OpenAiCompatibleStreamTransport {
@@ -97,7 +102,10 @@ fn skips_openrouter_style_keep_alive_comment_lines() {
     server.join().expect("server thread completes");
 
     result.expect("stream completes despite comment lines");
-    assert_eq!(deltas, vec![("Hi".to_owned(), false), (String::new(), true)]);
+    assert_eq!(
+        deltas,
+        vec![("Hi".to_owned(), false), (String::new(), true)]
+    );
 }
 
 #[test]
@@ -110,7 +118,10 @@ fn a_mid_stream_error_event_fails_the_call_without_a_done_chunk() {
     let error = result.expect_err("an error event must fail the stream");
     assert_eq!(error.code, "ERR_MODEL_FAILED");
     assert!(error.message.contains("insufficient credits"));
-    assert!(deltas.is_empty(), "on_delta must not be called for an error event");
+    assert!(
+        deltas.is_empty(),
+        "on_delta must not be called for an error event"
+    );
 }
 
 #[test]
@@ -126,7 +137,8 @@ fn malformed_json_in_a_data_line_fails_the_call() {
 
 #[test]
 fn a_connection_that_closes_without_done_fails_the_call() {
-    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+    let body =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
     let (endpoint, server) = spawn_sse_server(body.to_owned());
     let (result, deltas) = run(&endpoint);
     server.join().expect("server thread completes");
