@@ -33,6 +33,8 @@ fn usage() {
     eprintln!("  viper-boxd backend-self-test --socket PATH");
     eprintln!("  viper-boxd filesystem-probe --socket PATH");
     eprintln!("  viper-boxd network-probe --socket PATH");
+    eprintln!("  viper-boxd signal-probe --socket PATH");
+    eprintln!("  viper-boxd resource-probe --socket PATH");
     eprintln!(
         "  viper-boxd gateway-probe --socket PATH --gateway-ref REF [--call PING|MODEL_GENERATE]"
     );
@@ -322,6 +324,62 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("network probe error: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if args.get(1).map(String::as_str) == Some("signal-probe") {
+        let socket =
+            arg_value(&args[2..], "--socket").unwrap_or_else(|| "/tmp/viper-helper.sock".into());
+        let request = Request {
+            version: IPC_VERSION.into(),
+            request_id: format!("signal-probe-{}", std::process::id()),
+            method: "signal_probe".into(),
+            params: json!({}),
+        };
+        match send_request(&socket, &request) {
+            Ok(response) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response)
+                        .expect("JSON serialization cannot fail")
+                );
+                return if response.ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                };
+            }
+            Err(error) => {
+                eprintln!("signal probe error: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if args.get(1).map(String::as_str) == Some("resource-probe") {
+        let socket =
+            arg_value(&args[2..], "--socket").unwrap_or_else(|| "/tmp/viper-helper.sock".into());
+        let request = Request {
+            version: IPC_VERSION.into(),
+            request_id: format!("resource-probe-{}", std::process::id()),
+            method: "resource_probe".into(),
+            params: json!({}),
+        };
+        match send_request(&socket, &request) {
+            Ok(response) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response)
+                        .expect("JSON serialization cannot fail")
+                );
+                return if response.ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(1)
+                };
+            }
+            Err(error) => {
+                eprintln!("resource probe error: {error}");
                 return ExitCode::from(2);
             }
         }
